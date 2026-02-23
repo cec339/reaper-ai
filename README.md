@@ -44,6 +44,9 @@ reaper-ai context                          # list tracks and FX
 reaper-ai track-info "Vocals"              # FX chain + params
 reaper-ai set-param "Vocals" 0 "Gain=0.5"  # set a parameter
 reaper-ai create-track "Bass DI"           # create a track
+reaper-ai get-envelope master Volume       # read master volume envelope
+reaper-ai set-envelope master Volume '[{"time":176,"value":1.0},{"time":180,"value":0.0}]'  # fade out
+reaper-ai clear-envelope master Volume     # remove all automation points
 ```
 
 Or add the MCP server to Claude Code's config for tool-based access.
@@ -92,6 +95,9 @@ Both the Lua daemon and Python bridge need to point at the same queue path.
 | `reaper_list_presets` | List available presets for an FX |
 | `reaper_set_preset` | Activate a preset by name or index |
 | `reaper_apply_plan` | Apply a multi-step FX plan to a track |
+| `reaper_get_envelope` | Read automation envelope points from a track |
+| `reaper_set_envelope_points` | Insert automation points (volume fades, pan sweeps, etc.) |
+| `reaper_clear_envelope` | Remove all automation points from an envelope |
 
 ## Building the exe
 
