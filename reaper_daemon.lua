@@ -197,8 +197,12 @@ local function resolve_queue_path()
     return script_dir .. "/queue"
   end
 
-  -- Fallback
-  return "C:/dev/reaper-ai/queue"
+  -- Fallback: use LOCALAPPDATA/reaper-ai/queue (matches installer default)
+  local appdata = os.getenv("LOCALAPPDATA")
+  if appdata then
+    return appdata:gsub("\\", "/") .. "/reaper-ai/queue"
+  end
+  return "reaper-ai/queue"
 end
 
 -- ---------------------------------------------------------------------------
@@ -206,6 +210,9 @@ end
 -- ---------------------------------------------------------------------------
 
 local function find_track_by_name(name)
+  if name:lower() == "master" then
+    return reaper.GetMasterTrack(0), -1
+  end
   local count = reaper.CountTracks(0)
   for i = 0, count - 1 do
     local tr = reaper.GetTrack(0, i)
@@ -578,6 +585,202 @@ local function op_set_preset(cmd)
 end
 
 -- ---------------------------------------------------------------------------
+-- Envelope helpers and operations
+-- ---------------------------------------------------------------------------
+
+local ENV_CHUNK_TAGS = {
+  Volume = "VOLENV2",
+  Pan    = "PANENV2",
+  Mute   = "MUTEENV",
+  Width  = "WIDTHENV2",
+}
+
+local MASTER_ENV_CHUNK_TAGS = {
+  Volume = "MASTERVOLENV2",
+  Pan    = "MASTERPANENV2",
+  Mute   = "MASTERMUTEENV",
+  Width  = "MASTERWIDTHENV2",
+}
+
+local function ensure_envelope_visible(track, env_name, is_master)
+  local tags = is_master and MASTER_ENV_CHUNK_TAGS or ENV_CHUNK_TAGS
+  local tag = tags[env_name]
+  if not tag then return false end
+
+  local _, chunk = reaper.GetTrackStateChunk(track, "", false)
+  if not chunk then return false end
+
+  -- Already has this envelope block — assume it's visible enough
+  if chunk:find("<" .. tag .. "\n") or chunk:find("<" .. tag .. "\r") then
+    return false
+  end
+
+  -- Inject a minimal envelope block before the final ">"
+  local guid = reaper.genGuid("")
+  local env_block = "<" .. tag .. "\n"
+    .. "EGUID " .. guid .. "\n"
+    .. "ACT 1 -1\n"
+    .. "VIS 1 1 1.0\n"
+    .. "LANEHEIGHT 0 0\n"
+    .. "ARM 0\n"
+    .. "DEFSHAPE 0 -1 -1\n"
+    .. ">\n"
+
+  -- Insert before the final ">" of the track chunk
+  local last_close = chunk:match(".*()>")
+  if not last_close then return false end
+  local new_chunk = chunk:sub(1, last_close - 1) .. env_block .. chunk:sub(last_close)
+
+  reaper.SetTrackStateChunk(track, new_chunk, false)
+  return true
+end
+
+local function resolve_envelope(track, env_name, is_master)
+  local env = reaper.GetTrackEnvelopeByName(track, env_name)
+  if env then return env, nil end
+
+  -- Try to auto-show the envelope
+  if ensure_envelope_visible(track, env_name, is_master) then
+    env = reaper.GetTrackEnvelopeByName(track, env_name)
+    if env then return env, nil end
+  end
+
+  return nil, env_name .. " envelope not supported (use Volume, Pan, Mute, or Width)"
+end
+
+local function op_get_envelope(cmd)
+  local track_name = cmd.track
+  local env_name = cmd.envelope
+  if not track_name then return { status = "error", errors = {"Missing track name"} } end
+  if not env_name then return { status = "error", errors = {"Missing envelope name"} } end
+
+  local tr, tr_idx = find_track_by_name(track_name)
+  if not tr then return { status = "error", errors = {"Track not found: " .. track_name} } end
+
+  local _, actual_name = reaper.GetTrackName(tr)
+  local env, err = resolve_envelope(tr, env_name, tr_idx == -1)
+  if not env then return { status = "error", errors = {err}, track = actual_name } end
+
+  -- Read points from chunk for consistent scaling with write
+  local _, chunk = reaper.GetEnvelopeStateChunk(env, "", false)
+  local points = {}
+  local idx = 0
+  for line in chunk:gmatch("[^\r\n]+") do
+    local time, value, shape = line:match("^PT ([%d%.%-e]+) ([%d%.%-e]+) (%d+)")
+    if time then
+      points[#points + 1] = {
+        index = idx,
+        time = tonumber(time),
+        value = tonumber(value),
+        shape = tonumber(shape),
+        tension = 0
+      }
+      idx = idx + 1
+    end
+  end
+
+  return { status = "ok", track = actual_name, envelope = env_name, points = points }
+end
+
+local function op_set_envelope_points(cmd)
+  local track_name = cmd.track
+  local env_name = cmd.envelope
+  local pts = cmd.points
+  local clear_first = cmd.clear_first
+  if not track_name then return { status = "error", errors = {"Missing track name"} } end
+  if not env_name then return { status = "error", errors = {"Missing envelope name"} } end
+  if not pts or #pts == 0 then return { status = "error", errors = {"Missing points"} } end
+
+  local tr, tr_idx = find_track_by_name(track_name)
+  if not tr then return { status = "error", errors = {"Track not found: " .. track_name} } end
+
+  local _, actual_name = reaper.GetTrackName(tr)
+  local env, err = resolve_envelope(tr, env_name, tr_idx == -1)
+  if not env then return { status = "error", errors = {err}, track = actual_name } end
+
+  reaper.Undo_BeginBlock()
+
+  -- Read current envelope chunk to preserve header settings
+  local _, chunk = reaper.GetEnvelopeStateChunk(env, "", false)
+
+  -- Build new point lines
+  local pt_lines = {}
+  for _, p in ipairs(pts) do
+    local shape = p.shape or 0
+    local tension = p.tension or 0
+    pt_lines[#pt_lines + 1] = string.format("PT %.14g %.14g %d", p.time, p.value, shape)
+  end
+
+  -- Strip existing PT lines from chunk, keep everything else
+  local header_lines = {}
+  for line in chunk:gmatch("[^\r\n]+") do
+    if not line:match("^PT ") then
+      header_lines[#header_lines + 1] = line
+    end
+  end
+
+  -- Remove the closing ">" so we can append points before it
+  if header_lines[#header_lines] == ">" then
+    table.remove(header_lines)
+  end
+
+  -- If not clearing, keep existing PT lines from chunk
+  if not clear_first then
+    for line in chunk:gmatch("[^\r\n]+") do
+      if line:match("^PT ") then
+        pt_lines[#pt_lines + 1] = line
+      end
+    end
+  end
+
+  -- Sort point lines by time
+  table.sort(pt_lines, function(a, b)
+    local ta = tonumber(a:match("^PT ([%d%.%-e]+)"))
+    local tb = tonumber(b:match("^PT ([%d%.%-e]+)"))
+    return (ta or 0) < (tb or 0)
+  end)
+
+  -- Rebuild chunk
+  local new_chunk = table.concat(header_lines, "\n") .. "\n"
+  for _, pl in ipairs(pt_lines) do
+    new_chunk = new_chunk .. pl .. "\n"
+  end
+  new_chunk = new_chunk .. ">\n"
+
+  reaper.SetEnvelopeStateChunk(env, new_chunk, false)
+
+  reaper.Undo_EndBlock("Set envelope points: " .. env_name, -1)
+  reaper.UpdateArrange()
+  reaper.TrackList_AdjustWindows(false)
+
+  return { status = "ok", track = actual_name, envelope = env_name, points_added = #pts }
+end
+
+local function op_clear_envelope(cmd)
+  local track_name = cmd.track
+  local env_name = cmd.envelope
+  if not track_name then return { status = "error", errors = {"Missing track name"} } end
+  if not env_name then return { status = "error", errors = {"Missing envelope name"} } end
+
+  local tr, tr_idx = find_track_by_name(track_name)
+  if not tr then return { status = "error", errors = {"Track not found: " .. track_name} } end
+
+  local _, actual_name = reaper.GetTrackName(tr)
+  local env, err = resolve_envelope(tr, env_name, tr_idx == -1)
+  if not env then return { status = "error", errors = {err}, track = actual_name } end
+
+  local count = reaper.CountEnvelopePoints(env)
+
+  reaper.Undo_BeginBlock()
+  reaper.DeleteEnvelopePointRange(env, -1, reaper.GetProjectLength(0) + 1000)
+  reaper.Undo_EndBlock("Clear envelope: " .. env_name, -1)
+  reaper.UpdateArrange()
+  reaper.TrackList_AdjustWindows(false)
+
+  return { status = "ok", track = actual_name, envelope = env_name, points_removed = count }
+end
+
+-- ---------------------------------------------------------------------------
 -- Command dispatcher
 -- ---------------------------------------------------------------------------
 
@@ -603,6 +806,12 @@ local function dispatch(cmd)
     return op_set_param(cmd)
   elseif op == "set_preset" then
     return op_set_preset(cmd)
+  elseif op == "get_envelope" then
+    return op_get_envelope(cmd)
+  elseif op == "set_envelope_points" then
+    return op_set_envelope_points(cmd)
+  elseif op == "clear_envelope" then
+    return op_clear_envelope(cmd)
   else
     return { status = "error", errors = {"Unknown operation: " .. tostring(op)} }
   end

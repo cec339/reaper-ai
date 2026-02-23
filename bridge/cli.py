@@ -5,7 +5,14 @@ import json
 import sys
 
 from bridge.ipc import send_command
-from bridge.reaper_state import format_apply_result, format_context, format_presets, format_track_fx
+from bridge.reaper_state import (
+    format_apply_result,
+    format_context,
+    format_envelope,
+    format_envelope_result,
+    format_presets,
+    format_track_fx,
+)
 
 
 def cmd_context(args):
@@ -98,6 +105,51 @@ def cmd_set_preset(args):
         sys.exit(1)
 
 
+def cmd_get_envelope(args):
+    """Read automation envelope points from a track."""
+    result = send_command("get_envelope", track=args.track, envelope=args.envelope)
+    if result.get("status") == "ok":
+        print(format_envelope(result))
+    else:
+        errors = result.get("errors", ["Unknown error"])
+        print(f"Error: {'; '.join(errors)}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_set_envelope(args):
+    """Insert automation points on an envelope."""
+    try:
+        points = json.loads(args.points_json)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON for points: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    result = send_command(
+        "set_envelope_points",
+        track=args.track,
+        envelope=args.envelope,
+        points=points,
+        clear_first=args.clear,
+    )
+    if result.get("status") == "ok":
+        print(format_envelope_result(result))
+    else:
+        errors = result.get("errors", ["Unknown error"])
+        print(f"Error: {'; '.join(errors)}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_clear_envelope(args):
+    """Remove all points from an envelope."""
+    result = send_command("clear_envelope", track=args.track, envelope=args.envelope)
+    if result.get("status") == "ok":
+        print(format_envelope_result(result))
+    else:
+        errors = result.get("errors", ["Unknown error"])
+        print(f"Error: {'; '.join(errors)}", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_apply(args):
     """Send a plan JSON file to REAPER."""
     try:
@@ -179,6 +231,20 @@ def main():
     preset_group.add_argument("--name", dest="preset", help="Preset name")
     preset_group.add_argument("--index", dest="preset_index", type=int, help="Preset index")
 
+    p_get_env = sub.add_parser("get-envelope", help="Read automation envelope points")
+    p_get_env.add_argument("track", help="Track name (or 'master')")
+    p_get_env.add_argument("envelope", help="Envelope name: Volume, Pan, Mute, Width")
+
+    p_set_env = sub.add_parser("set-envelope", help="Insert automation points on an envelope")
+    p_set_env.add_argument("track", help="Track name (or 'master')")
+    p_set_env.add_argument("envelope", help="Envelope name: Volume, Pan, Mute, Width")
+    p_set_env.add_argument("points_json", help='JSON array of points, e.g. \'[{"time":0,"value":1.0}]\'')
+    p_set_env.add_argument("--clear", action="store_true", help="Clear existing points first")
+
+    p_clr_env = sub.add_parser("clear-envelope", help="Remove all points from an envelope")
+    p_clr_env.add_argument("track", help="Track name (or 'master')")
+    p_clr_env.add_argument("envelope", help="Envelope name: Volume, Pan, Mute, Width")
+
     sub.add_parser("apply-stdin", help="Read plan JSON from stdin")
 
     args = parser.parse_args()
@@ -191,6 +257,9 @@ def main():
         "track-info": cmd_track_info,
         "list-presets": cmd_list_presets,
         "set-preset": cmd_set_preset,
+        "get-envelope": cmd_get_envelope,
+        "set-envelope": cmd_set_envelope,
+        "clear-envelope": cmd_clear_envelope,
         "apply": cmd_apply,
         "apply-stdin": cmd_apply_stdin,
     }

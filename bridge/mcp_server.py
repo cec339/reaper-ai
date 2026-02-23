@@ -8,6 +8,8 @@ from bridge.ipc import send_command
 from bridge.reaper_state import (
     format_apply_result,
     format_context,
+    format_envelope,
+    format_envelope_result,
     format_presets,
     format_track_fx,
 )
@@ -16,7 +18,10 @@ mcp = FastMCP(
     "reaper-ai",
     instructions=(
         "Control REAPER DAW via AI. Use reaper_get_context first to see "
-        "available tracks and FX, then manipulate them with the other tools."
+        "available tracks and FX, then manipulate them with the other tools. "
+        "GAIN STAGING: Whenever you boost EQ, add saturation, or increase any "
+        "gain parameter, always compensate output levels to avoid clipping. "
+        "Tell the user what gain changes you made and how you compensated."
     ),
 )
 
@@ -81,6 +86,11 @@ def reaper_duplicate_track(track: str, new_name: str | None = None) -> str:
 @mcp.tool()
 def reaper_set_param(track: str, fx_index: int, params: str) -> str:
     """Set one or more parameters on an FX plugin.
+
+    IMPORTANT: When boosting any gain/level parameter above 0.5 (unity), always
+    compensate by trimming the plugin's output gain or a later stage to avoid
+    clipping. When cutting significantly, consider making up gain to maintain
+    level. Inform the user of all gain staging decisions.
 
     Args:
         track: Track name or substring to match
@@ -151,6 +161,9 @@ def reaper_apply_plan(track: str, plan: str) -> str:
     """Apply a multi-step FX plan to a track. The plan is a JSON array of steps,
     where each step can add FX, set parameters, or set presets.
 
+    IMPORTANT: When a plan boosts or cuts gain at any stage, include compensating
+    gain staging to maintain proper headroom. Inform the user of all level changes.
+
     Args:
         track: Track name or substring to match
         plan: JSON string — an array of plan steps, e.g.
@@ -163,6 +176,76 @@ def reaper_apply_plan(track: str, plan: str) -> str:
 
     result = send_command("apply_plan", track=track, plan=plan_data)
     return format_apply_result(result)
+
+
+@mcp.tool()
+def reaper_get_envelope(track: str, envelope: str) -> str:
+    """Read automation envelope points from a track.
+
+    Args:
+        track: Track name or substring to match, or "master" for the master track
+        envelope: Envelope name — one of "Volume", "Pan", "Mute", "Width".
+                  The envelope must be visible on the track (press V on the track to show envelopes).
+                  Value ranges: Volume 0.0–2.0 (1.0 = 0dB), Pan -1.0 to 1.0 (0 = center).
+    """
+    result = send_command("get_envelope", track=track, envelope=envelope)
+    if result.get("status") == "ok":
+        return format_envelope(result)
+    return _error_text(result)
+
+
+@mcp.tool()
+def reaper_set_envelope_points(
+    track: str,
+    envelope: str,
+    points: str,
+    clear_first: bool = False,
+) -> str:
+    """Insert automation points on a track envelope.
+
+    Args:
+        track: Track name or substring to match, or "master" for the master track
+        envelope: Envelope name — one of "Volume", "Pan", "Mute", "Width".
+                  The envelope must be visible on the track (press V on the track to show envelopes).
+                  Value ranges: Volume 0.0–2.0 (1.0 = 0dB), Pan -1.0 to 1.0 (0 = center).
+        points: JSON array of point objects. Each point has:
+                - time (float): position in seconds
+                - value (float): envelope value
+                - shape (int, optional): 0=Linear, 1=Square, 2=Slow start/end, 3=Fast start, 4=Fast end, 5=Bezier. Default 0.
+                - tension (float, optional): -1.0 to 1.0, used with Bezier shape. Default 0.
+                Example: '[{"time": 176, "value": 1.0}, {"time": 180, "value": 0.0}]'
+        clear_first: If true, remove all existing points before inserting new ones
+    """
+    try:
+        points_list = json.loads(points)
+    except json.JSONDecodeError as e:
+        return f"Error: Invalid JSON for points: {e}"
+
+    result = send_command(
+        "set_envelope_points",
+        track=track,
+        envelope=envelope,
+        points=points_list,
+        clear_first=clear_first,
+    )
+    if result.get("status") == "ok":
+        return format_envelope_result(result)
+    return _error_text(result)
+
+
+@mcp.tool()
+def reaper_clear_envelope(track: str, envelope: str) -> str:
+    """Remove all automation points from a track envelope.
+
+    Args:
+        track: Track name or substring to match, or "master" for the master track
+        envelope: Envelope name — one of "Volume", "Pan", "Mute", "Width".
+                  The envelope must be visible on the track (press V on the track to show envelopes).
+    """
+    result = send_command("clear_envelope", track=track, envelope=envelope)
+    if result.get("status") == "ok":
+        return format_envelope_result(result)
+    return _error_text(result)
 
 
 def _is_interactive() -> bool:
