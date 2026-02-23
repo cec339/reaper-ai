@@ -1,17 +1,26 @@
 """File-based IPC for communicating with the REAPER Lua daemon."""
 
 import json
+import sys
 import time
 import uuid
 from pathlib import Path
 
-DEFAULT_QUEUE_PATH = Path(__file__).resolve().parent.parent / "queue"
+
+def _base_dir() -> Path:
+    """Project root: works both as normal package and PyInstaller frozen exe."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+DEFAULT_QUEUE_PATH = _base_dir() / "queue"
 DEFAULT_TIMEOUT = 10.0
 POLL_INTERVAL = 0.1
 
 
 def load_config() -> dict:
-    config_path = Path(__file__).resolve().parent.parent / "config.json"
+    config_path = _base_dir() / "config.json"
     if config_path.exists():
         with open(config_path, encoding="utf-8") as f:
             return json.load(f)
