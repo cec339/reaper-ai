@@ -41,8 +41,8 @@ Use the CLI directly:
 
 ```bash
 reaper-ai context                          # list tracks and FX
-reaper-ai track-info "Vocals"              # FX chain + params
-reaper-ai set-param "Vocals" 0 "Gain=0.5"  # set a parameter
+reaper-ai track-info "Vocals"              # FX chain + params (with display values: Hz, dB, ms, %)
+reaper-ai set-param "Vocals" 0 "Gain=0.5"  # set a parameter (confirms with display units)
 reaper-ai create-track "Bass DI"           # create a track
 reaper-ai get-envelope master Volume       # read master volume envelope
 reaper-ai set-envelope master Volume '[{"time":176,"value":1.0},{"time":180,"value":0.0}]'  # fade out
@@ -88,16 +88,23 @@ Both the Lua daemon and Python bridge need to point at the same queue path.
 | Tool | Description |
 |------|-------------|
 | `reaper_get_context` | List all tracks and installed FX plugins |
-| `reaper_get_track_fx` | Get FX chain and parameter values for a track |
+| `reaper_get_track_fx` | Get FX chain and parameter values with display units (Hz, dB, ms, %) |
 | `reaper_create_track` | Create a new empty track |
 | `reaper_duplicate_track` | Duplicate a track with media items and FX |
-| `reaper_set_param` | Set FX parameter values |
+| `reaper_set_param` | Set FX parameter values — confirms with display units |
 | `reaper_list_presets` | List available presets for an FX |
 | `reaper_set_preset` | Activate a preset by name or index |
 | `reaper_apply_plan` | Apply a multi-step FX plan to a track |
 | `reaper_get_envelope` | Read automation envelope points from a track |
 | `reaper_set_envelope_points` | Insert automation points (volume fades, pan sweeps, etc.) |
 | `reaper_clear_envelope` | Remove all automation points from an envelope |
+| `reaper_add_send` | Create a send (routing) between two tracks |
+| `reaper_get_sends` | List all sends from a track with routing config |
+| `reaper_load_sample_rs5k` | Load a sample into ReaSamplOmatic5000 |
+| `reaper_setup_reagate_midi` | Add/configure ReaGate for MIDI triggering |
+| `reaper_set_track_folder` | Set folder depth on a track |
+| `reaper_set_track_visible` | Show or hide a track in TCP and/or mixer |
+| `reaper_drum_augment` | SSD-style drum augment: sample trigger from audio track |
 
 ## Building the exe
 

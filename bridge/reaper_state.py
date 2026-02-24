@@ -47,7 +47,11 @@ def format_track_fx(data: dict) -> str:
         lines.append("  " + "-" * 40)
         params = fx.get("params", [])
         for p in params:
-            lines.append(f"    {p['index']:>3}. {p['name']}: {p['value']:.4f}")
+            disp = p.get("display", "")
+            if disp:
+                lines.append(f"    {p['index']:>3}. {p['name']}: {p['value']:.4f} ({disp})")
+            else:
+                lines.append(f"    {p['index']:>3}. {p['name']}: {p['value']:.4f}")
 
     return "\n".join(lines)
 
@@ -133,9 +137,78 @@ def format_apply_result(data: dict) -> str:
 
     lines = [f"Track: {track}", f"Status: {status}", f"Steps applied: {applied}"]
 
+    confirmed = data.get("confirmed", [])
+    if confirmed:
+        lines.append("Confirmed params:")
+        for c in confirmed:
+            disp = c.get("display", "")
+            if disp:
+                lines.append(f"  {c['name']}: {c['value']:.4f} ({disp})")
+            else:
+                lines.append(f"  {c['name']}: {c['value']:.4f}")
+
     if errors:
         lines.append(f"Errors ({len(errors)}):")
         for e in errors:
             lines.append(f"  - {e}")
+
+    return "\n".join(lines)
+
+
+def format_sends(data: dict) -> str:
+    """Format get_sends response into readable text."""
+    lines = []
+    track = data.get("track", "?")
+    sends = data.get("sends", [])
+
+    if not sends:
+        lines.append(f"Track '{track}' has no sends.")
+        return "\n".join(lines)
+
+    lines.append(f"Sends from '{track}' ({len(sends)}):")
+    lines.append("=" * 50)
+
+    for s in sends:
+        src_chan = s.get("src_chan", 0)
+        midi_flags = s.get("midi_flags", 0)
+        vol = s.get("volume", 1.0)
+
+        send_type = "both"
+        if src_chan == -1:
+            send_type = "midi-only"
+        elif midi_flags == 31:
+            send_type = "audio-only"
+
+        vol_db = _vol_to_db(vol)
+        lines.append(
+            f"  [{s['index']}] -> '{s.get('dest_track', '?')}' "
+            f"({send_type}, vol={vol_db})"
+        )
+
+    return "\n".join(lines)
+
+
+def format_drum_augment(data: dict) -> str:
+    """Format drum_augment response into readable text."""
+    lines = []
+    status = data.get("status", "unknown")
+
+    lines.append(f"Status: {status}")
+    lines.append(f"Audio track: {data.get('audio_track', '?')}")
+    lines.append(f"RS5k track: {data.get('rs5k_track', '?')} (index {data.get('rs5k_track_index', '?')})")
+    lines.append(f"MIDI note: {data.get('midi_note', '?')}")
+
+    if data.get("reagate_fx_index") is not None:
+        lines.append(f"ReaGate FX index: {data['reagate_fx_index']}")
+    if data.get("rs5k_fx_index") is not None:
+        lines.append(f"RS5k FX index: {data['rs5k_fx_index']}")
+    if data.get("send_index") is not None:
+        lines.append(f"Send index: {data['send_index']}")
+
+    warnings = data.get("warnings", [])
+    if warnings:
+        lines.append(f"Warnings ({len(warnings)}):")
+        for w in warnings:
+            lines.append(f"  - {w}")
 
     return "\n".join(lines)

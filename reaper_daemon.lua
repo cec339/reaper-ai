@@ -229,6 +229,143 @@ local function find_track_by_name(name)
   return nil, nil
 end
 
+-- Strict track finder: errors if fuzzy match hits multiple tracks
+-- Returns track, index, error_string
+local function find_track_strict(name_or_index)
+  -- Numeric index
+  if type(name_or_index) == "number" then
+    local idx = math.floor(name_or_index)
+    local count = reaper.CountTracks(0)
+    if idx < 0 or idx >= count then
+      return nil, nil, "Track index " .. idx .. " out of range (0-" .. (count - 1) .. ")"
+    end
+    return reaper.GetTrack(0, idx), idx, nil
+  end
+  -- String: try exact first
+  local name = tostring(name_or_index)
+  if name:lower() == "master" then
+    return reaper.GetMasterTrack(0), -1, nil
+  end
+  local count = reaper.CountTracks(0)
+  for i = 0, count - 1 do
+    local tr = reaper.GetTrack(0, i)
+    local _, tr_name = reaper.GetTrackName(tr)
+    if tr_name == name then return tr, i, nil end
+  end
+  -- Fuzzy: collect ALL substring matches
+  local name_lower = name:lower()
+  local matches = {}
+  for i = 0, count - 1 do
+    local tr = reaper.GetTrack(0, i)
+    local _, tr_name = reaper.GetTrackName(tr)
+    if tr_name:lower():find(name_lower, 1, true) then
+      matches[#matches + 1] = { tr = tr, idx = i, name = tr_name }
+    end
+  end
+  if #matches == 0 then
+    return nil, nil, "Track not found: " .. name
+  end
+  if #matches == 1 then
+    return matches[1].tr, matches[1].idx, nil
+  end
+  -- Ambiguous
+  local names = {}
+  for _, m in ipairs(matches) do
+    names[#names + 1] = string.format("[%d] %s", m.idx, m.name)
+  end
+  return nil, nil, "Ambiguous track name '" .. name .. "' matches " .. #matches
+    .. " tracks: " .. table.concat(names, ", ")
+end
+
+-- Resolve track from name (string) or index (number), using find_track_by_name
+-- for backward compat (first-match fuzzy)
+local function resolve_track(name_or_index)
+  if type(name_or_index) == "number" then
+    local idx = math.floor(name_or_index)
+    local count = reaper.CountTracks(0)
+    if idx < 0 or idx >= count then
+      return nil, nil
+    end
+    return reaper.GetTrack(0, idx), idx
+  end
+  return find_track_by_name(tostring(name_or_index))
+end
+
+local function find_param_index(tr, fx_idx, param_name)
+  local norm_target = normalize(param_name)
+  local param_count = reaper.TrackFX_GetNumParams(tr, fx_idx)
+  -- Exact normalized match first
+  for pi = 0, param_count - 1 do
+    local _, pname = reaper.TrackFX_GetParamName(tr, fx_idx, pi)
+    if normalize(pname) == norm_target then return pi end
+  end
+  -- Substring match
+  for pi = 0, param_count - 1 do
+    local _, pname = reaper.TrackFX_GetParamName(tr, fx_idx, pi)
+    if normalize(pname):find(norm_target, 1, true) then return pi end
+  end
+  return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Unit conversion helpers
+-- ---------------------------------------------------------------------------
+
+-- MIDI note 0-127 -> normalized 0.0-1.0
+local function midi_note_to_norm(note)
+  return math.max(0, math.min(127, note)) / 127.0
+end
+
+-- Scan all RS5k instances across all tracks for used MIDI notes
+local function scan_used_midi_notes()
+  local used = {}
+  local count = reaper.CountTracks(0)
+  for i = 0, count - 1 do
+    local tr = reaper.GetTrack(0, i)
+    local fx_count = reaper.TrackFX_GetCount(tr)
+    for fi = 0, fx_count - 1 do
+      local _, fx_name = reaper.TrackFX_GetFXName(tr, fi)
+      if fx_name:find("RS5K") or fx_name:find("ReaSamplOmatic5000") or fx_name:find("reasamplomatic") then
+        -- Note range start param: typically named "Note range start"
+        local pi = find_param_index(tr, fi, "Note range start")
+        if pi then
+          local val = reaper.TrackFX_GetParamNormalized(tr, fi, pi)
+          local note = math.floor(val * 127 + 0.5)
+          used[note] = true
+        end
+      end
+    end
+  end
+  return used
+end
+
+-- General MIDI drum map defaults
+local GM_DRUM_DEFAULTS = {
+  kick = 36, snare = 38, hihat = 42, ["hi-hat"] = 42,
+  ["hihat open"] = 46, ["hi-hat open"] = 46,
+  ["tom low"] = 50, ["tom mid"] = 47, ["tom high"] = 52,
+  crash = 49, ride = 51,
+}
+
+-- Pick a MIDI note: use default for drum type if available and unused, else find next free
+local function pick_midi_note(drum_type, explicit_note)
+  if explicit_note then return explicit_note end
+  local used = scan_used_midi_notes()
+  -- Try GM default
+  if drum_type then
+    local default_note = GM_DRUM_DEFAULTS[drum_type:lower()]
+    if default_note and not used[default_note] then
+      return default_note
+    end
+  end
+  -- Find first unused note in drum range 35-81
+  for n = 35, 81 do
+    if not used[n] then return n end
+  end
+  -- Fallback: 60 (C4)
+  return 60
+end
+
 local function op_get_context()
   local tracks = {}
   local count = reaper.CountTracks(0)
@@ -281,7 +418,8 @@ local function op_get_track_fx(cmd)
     for pi = 0, param_count - 1 do
       local _, pname = reaper.TrackFX_GetParamName(tr, fi, pi)
       local val = reaper.TrackFX_GetParamNormalized(tr, fi, pi)
-      params[#params + 1] = { index = pi, name = pname, value = val }
+      local _, display = reaper.TrackFX_GetFormattedParamValue(tr, fi, pi)
+      params[#params + 1] = { index = pi, name = pname, value = val, display = display }
     end
     fx_chain[#fx_chain + 1] = {
       index = fi,
@@ -291,22 +429,6 @@ local function op_get_track_fx(cmd)
   end
 
   return { status = "ok", track = actual_name, fx_chain = fx_chain }
-end
-
-local function find_param_index(tr, fx_idx, param_name)
-  local norm_target = normalize(param_name)
-  local param_count = reaper.TrackFX_GetNumParams(tr, fx_idx)
-  -- Exact normalized match first
-  for pi = 0, param_count - 1 do
-    local _, pname = reaper.TrackFX_GetParamName(tr, fx_idx, pi)
-    if normalize(pname) == norm_target then return pi end
-  end
-  -- Substring match
-  for pi = 0, param_count - 1 do
-    local _, pname = reaper.TrackFX_GetParamName(tr, fx_idx, pi)
-    if normalize(pname):find(norm_target, 1, true) then return pi end
-  end
-  return nil
 end
 
 local function op_apply_plan(cmd)
@@ -346,26 +468,46 @@ local function op_apply_plan(cmd)
 
     elseif step.action == "set_param" then
       local fx_index = step.fx_index
-      local param_name = step.param_name
-      local value = step.value
-      if fx_index == nil or not param_name or value == nil then
-        errors[#errors + 1] = "set_param step missing required fields"
-      else
-        -- fx_index in the plan is relative to the plan's own FX additions
-        -- The actual REAPER fx index = base_fx_count + fx_index
+      if fx_index == nil then
+        errors[#errors + 1] = "set_param step missing fx_index"
+      elseif step.params and #step.params > 0 then
+        -- Array format: {"action":"set_param","fx_index":0,"params":[{"name":"Gain","value":0.5}]}
         local real_fx_idx = base_fx_count + fx_index
         local fx_count = reaper.TrackFX_GetCount(tr)
         if real_fx_idx >= fx_count then
           errors[#errors + 1] = "FX index " .. fx_index .. " (real: " .. real_fx_idx .. ") out of range"
         else
-          local pi = find_param_index(tr, real_fx_idx, param_name)
+          for _, p in ipairs(step.params) do
+            if not p.name or p.value == nil then
+              errors[#errors + 1] = "set_param param entry missing name or value"
+            else
+              local pi = find_param_index(tr, real_fx_idx, p.name)
+              if not pi then
+                errors[#errors + 1] = "Param not found: " .. p.name .. " on FX " .. fx_index
+              else
+                reaper.TrackFX_SetParamNormalized(tr, real_fx_idx, pi, p.value)
+                applied = applied + 1
+              end
+            end
+          end
+        end
+      elseif step.param_name and step.value ~= nil then
+        -- Flat format: {"action":"set_param","fx_index":0,"param_name":"Gain","value":0.5}
+        local real_fx_idx = base_fx_count + fx_index
+        local fx_count = reaper.TrackFX_GetCount(tr)
+        if real_fx_idx >= fx_count then
+          errors[#errors + 1] = "FX index " .. fx_index .. " (real: " .. real_fx_idx .. ") out of range"
+        else
+          local pi = find_param_index(tr, real_fx_idx, step.param_name)
           if not pi then
-            errors[#errors + 1] = "Param not found: " .. param_name .. " on FX " .. fx_index
+            errors[#errors + 1] = "Param not found: " .. step.param_name .. " on FX " .. fx_index
           else
-            reaper.TrackFX_SetParamNormalized(tr, real_fx_idx, pi, value)
+            reaper.TrackFX_SetParamNormalized(tr, real_fx_idx, pi, step.value)
             applied = applied + 1
           end
         end
+      else
+        errors[#errors + 1] = "set_param step missing params array or param_name/value"
       end
 
     elseif step.action == "remove_fx" then
@@ -534,19 +676,22 @@ local function op_set_param(cmd)
   reaper.Undo_BeginBlock()
   local applied = 0
   local errors = {}
+  local confirmed = {}
   for _, p in ipairs(params) do
     local pi = find_param_index(tr, fx_index, p.name)
     if not pi then
       errors[#errors + 1] = "Param not found: " .. tostring(p.name)
     else
       reaper.TrackFX_SetParamNormalized(tr, fx_index, pi, p.value)
+      local _, disp = reaper.TrackFX_GetFormattedParamValue(tr, fx_index, pi)
       applied = applied + 1
+      confirmed[#confirmed + 1] = { name = p.name, value = p.value, display = disp }
     end
   end
   reaper.Undo_EndBlock("Set params on FX " .. fx_index, -1)
 
   local status = #errors > 0 and (applied > 0 and "partial" or "error") or "ok"
-  return { status = status, applied = applied, errors = errors, track = actual_name }
+  return { status = status, applied = applied, errors = errors, track = actual_name, confirmed = confirmed }
 end
 
 local function op_set_preset(cmd)
@@ -781,6 +926,462 @@ local function op_clear_envelope(cmd)
 end
 
 -- ---------------------------------------------------------------------------
+-- Internal helpers (no undo block) for composability
+-- ---------------------------------------------------------------------------
+
+local function _create_send(src_tr, dst_tr, send_type, midi_channel, audio_volume)
+  local send_idx = reaper.CreateTrackSend(src_tr, dst_tr)
+  if send_idx < 0 then
+    return nil, "Failed to create send"
+  end
+
+  send_type = send_type or "both"
+  if send_type == "midi" then
+    -- No audio: set source channel to -1 (None)
+    reaper.SetTrackSendInfo_Value(src_tr, 0, send_idx, "I_SRCCHAN", -1)
+    -- All MIDI channels
+    local midi_flags = 0
+    if midi_channel and midi_channel >= 0 and midi_channel <= 15 then
+      -- Specific channel: low 5 bits = channel + 1
+      midi_flags = midi_channel + 1
+    end
+    reaper.SetTrackSendInfo_Value(src_tr, 0, send_idx, "I_MIDIFLAGS", midi_flags)
+  elseif send_type == "audio" then
+    -- No MIDI: set MIDI flags to disable
+    reaper.SetTrackSendInfo_Value(src_tr, 0, send_idx, "I_MIDIFLAGS", 31)
+    if audio_volume then
+      reaper.SetTrackSendInfo_Value(src_tr, 0, send_idx, "D_VOL", audio_volume)
+    end
+  else
+    -- Both audio and MIDI
+    if audio_volume then
+      reaper.SetTrackSendInfo_Value(src_tr, 0, send_idx, "D_VOL", audio_volume)
+    end
+  end
+
+  -- Round-trip verify
+  local actual_dest = reaper.GetTrackSendInfo_Value(src_tr, 0, send_idx, "P_DESTTRACK")
+  if not actual_dest then
+    return nil, "Send created but verification failed"
+  end
+
+  return send_idx, nil
+end
+
+local function _load_rs5k(tr, sample_path, note, attack_ms, decay_ms, sustain, release_ms, volume_db, fx_index)
+  -- Validate sample file
+  if not file_exists(sample_path) then
+    return nil, "Sample file not found: " .. sample_path
+  end
+
+  local fx_idx
+  if fx_index then
+    -- Verify existing FX is RS5k
+    local fx_count = reaper.TrackFX_GetCount(tr)
+    if fx_index >= fx_count then
+      return nil, "FX index " .. fx_index .. " out of range"
+    end
+    local _, fx_name = reaper.TrackFX_GetFXName(tr, fx_index)
+    if not (fx_name:find("RS5K") or fx_name:find("ReaSamplOmatic5000") or fx_name:find("reasamplomatic")) then
+      return nil, "FX at index " .. fx_index .. " is not RS5k: " .. fx_name
+    end
+    fx_idx = fx_index
+  else
+    fx_idx = reaper.TrackFX_AddByName(tr, "ReaSamplOmatic5000", false, -1)
+    if fx_idx < 0 then
+      return nil, "Failed to add RS5k"
+    end
+  end
+
+  -- Load sample via named config parm
+  reaper.TrackFX_SetNamedConfigParm(tr, fx_idx, "FILE0", sample_path)
+  reaper.TrackFX_SetNamedConfigParm(tr, fx_idx, "DONE", "")
+
+  -- RS5k defaults to "Sample" mode which works for drum triggering
+  -- (responds to MIDI note-on, plays sample at original pitch)
+
+  -- Verify sample loaded
+  local _, loaded_path = reaper.TrackFX_GetNamedConfigParm(tr, fx_idx, "FILE0")
+  if not loaded_path or loaded_path == "" then
+    return fx_idx, "RS5k added but sample may not have loaded"
+  end
+
+  -- Set note range (both start and end to the same note for single-note trigger)
+  note = note or 60
+  local note_norm = midi_note_to_norm(note)
+  local pi_start = find_param_index(tr, fx_idx, "Note range start")
+  local pi_end = find_param_index(tr, fx_idx, "Note range end")
+  if pi_start then reaper.TrackFX_SetParamNormalized(tr, fx_idx, pi_start, note_norm) end
+  if pi_end then reaper.TrackFX_SetParamNormalized(tr, fx_idx, pi_end, note_norm) end
+
+  -- Set ADSR if provided (these are normalized 0-1; caller responsible for conversion)
+  local param_map = {
+    {"Attack", attack_ms},
+    {"Decay", decay_ms},
+    {"Sustain", sustain},
+    {"Release", release_ms},
+  }
+  local errors = {}
+  for _, pm in ipairs(param_map) do
+    if pm[2] then
+      local pi = find_param_index(tr, fx_idx, pm[1])
+      if pi then
+        reaper.TrackFX_SetParamNormalized(tr, fx_idx, pi, pm[2])
+      else
+        errors[#errors + 1] = "Param not found: " .. pm[1]
+      end
+    end
+  end
+
+  -- Volume/gain
+  if volume_db then
+    local pi = find_param_index(tr, fx_idx, "Volume")
+    if pi then
+      -- RS5k volume: normalize dB. Typically range is roughly -60 to +12 or similar.
+      -- We pass through as normalized 0-1 for now.
+      reaper.TrackFX_SetParamNormalized(tr, fx_idx, pi, volume_db)
+    end
+  end
+
+  -- Enable "Obey note-offs" by default for clean triggering
+  local pi_noteoff = find_param_index(tr, fx_idx, "Obey note-off")
+  if pi_noteoff then
+    reaper.TrackFX_SetParamNormalized(tr, fx_idx, pi_noteoff, 1.0)
+  end
+
+  return fx_idx, (#errors > 0) and table.concat(errors, "; ") or nil
+end
+
+local function _setup_reagate(tr, threshold_db, attack_ms, hold_ms, release_ms, midi_note, midi_channel, fx_index)
+  local fx_idx
+  if fx_index then
+    local fx_count = reaper.TrackFX_GetCount(tr)
+    if fx_index >= fx_count then
+      return nil, "FX index " .. fx_index .. " out of range"
+    end
+    fx_idx = fx_index
+  else
+    fx_idx = reaper.TrackFX_AddByName(tr, "ReaGate", false, -1)
+    if fx_idx < 0 then
+      return nil, "Failed to add ReaGate"
+    end
+  end
+
+  local errors = {}
+
+  -- Enable MIDI output: "Send MIDI" is a checkbox (0=off, 1=on)
+  local pi_midi = find_param_index(tr, fx_idx, "Send MIDI")
+  if pi_midi then
+    reaper.TrackFX_SetParamNormalized(tr, fx_idx, pi_midi, 1.0)
+  else
+    errors[#errors + 1] = "Could not find MIDI output param on ReaGate"
+  end
+
+  -- Set MIDI note for gate trigger
+  if midi_note then
+    local pi_note = find_param_index(tr, fx_idx, "MIDI note")
+    if not pi_note then pi_note = find_param_index(tr, fx_idx, "Note") end
+    if pi_note then
+      reaper.TrackFX_SetParamNormalized(tr, fx_idx, pi_note, midi_note_to_norm(midi_note))
+    else
+      errors[#errors + 1] = "Could not find MIDI note param on ReaGate"
+    end
+  end
+
+  -- Set MIDI channel
+  if midi_channel then
+    local pi_ch = find_param_index(tr, fx_idx, "MIDI channel")
+    if pi_ch then
+      reaper.TrackFX_SetParamNormalized(tr, fx_idx, pi_ch, midi_channel / 16.0)
+    end
+  end
+
+  -- Threshold (normalized 0-1 for now; user can discover exact mapping)
+  if threshold_db then
+    local pi_thresh = find_param_index(tr, fx_idx, "Threshold")
+    if pi_thresh then
+      reaper.TrackFX_SetParamNormalized(tr, fx_idx, pi_thresh, threshold_db)
+    else
+      errors[#errors + 1] = "Could not find Threshold param"
+    end
+  end
+
+  -- Attack
+  if attack_ms then
+    local pi = find_param_index(tr, fx_idx, "Attack")
+    if pi then reaper.TrackFX_SetParamNormalized(tr, fx_idx, pi, attack_ms) end
+  end
+
+  -- Hold
+  if hold_ms then
+    local pi = find_param_index(tr, fx_idx, "Hold")
+    if pi then reaper.TrackFX_SetParamNormalized(tr, fx_idx, pi, hold_ms) end
+  end
+
+  -- Release
+  if release_ms then
+    local pi = find_param_index(tr, fx_idx, "Release")
+    if pi then reaper.TrackFX_SetParamNormalized(tr, fx_idx, pi, release_ms) end
+  end
+
+  -- Default Dry=1.0, Wet=0.0 so original audio passes through unaffected
+  local pi_dry = find_param_index(tr, fx_idx, "Dry")
+  if pi_dry then reaper.TrackFX_SetParamNormalized(tr, fx_idx, pi_dry, 1.0) end
+  local pi_wet = find_param_index(tr, fx_idx, "Wet")
+  if pi_wet then reaper.TrackFX_SetParamNormalized(tr, fx_idx, pi_wet, 0.0) end
+
+  return fx_idx, (#errors > 0) and table.concat(errors, "; ") or nil
+end
+
+-- ---------------------------------------------------------------------------
+-- New operations: sends, RS5k, ReaGate, folders, visibility, drum_augment
+-- ---------------------------------------------------------------------------
+
+local function op_add_send(cmd)
+  local src_name = cmd.src_track
+  local dst_name = cmd.dest_track
+  if not src_name then return { status = "error", errors = {"Missing src_track"} } end
+  if not dst_name then return { status = "error", errors = {"Missing dest_track"} } end
+
+  local src_tr, _ = resolve_track(src_name)
+  if not src_tr then return { status = "error", errors = {"Source track not found: " .. tostring(src_name)} } end
+  local dst_tr, _ = resolve_track(dst_name)
+  if not dst_tr then return { status = "error", errors = {"Dest track not found: " .. tostring(dst_name)} } end
+
+  reaper.Undo_BeginBlock()
+  local send_idx, err = _create_send(src_tr, dst_tr, cmd.send_type, cmd.midi_channel, cmd.audio_volume)
+  reaper.Undo_EndBlock("Add send", -1)
+
+  if not send_idx then
+    return { status = "error", errors = {err} }
+  end
+  return { status = "ok", send_index = send_idx }
+end
+
+local function op_get_sends(cmd)
+  local track_name = cmd.track
+  if not track_name then return { status = "error", errors = {"Missing track"} } end
+
+  local tr, _ = resolve_track(track_name)
+  if not tr then return { status = "error", errors = {"Track not found: " .. tostring(track_name)} } end
+
+  local _, actual_name = reaper.GetTrackName(tr)
+  local num_sends = reaper.GetTrackNumSends(tr, 0)  -- category 0 = sends
+  local sends = {}
+
+  for si = 0, num_sends - 1 do
+    local dest_tr = reaper.GetTrackSendInfo_Value(tr, 0, si, "P_DESTTRACK")
+    local dest_name = ""
+    if dest_tr then
+      local _, dn = reaper.GetTrackName(dest_tr)
+      dest_name = dn
+    end
+    local src_chan = reaper.GetTrackSendInfo_Value(tr, 0, si, "I_SRCCHAN")
+    local midi_flags = reaper.GetTrackSendInfo_Value(tr, 0, si, "I_MIDIFLAGS")
+    local vol = reaper.GetTrackSendInfo_Value(tr, 0, si, "D_VOL")
+
+    sends[#sends + 1] = {
+      index = si,
+      dest_track = dest_name,
+      src_chan = src_chan,
+      midi_flags = midi_flags,
+      volume = vol,
+    }
+  end
+
+  return { status = "ok", track = actual_name, sends = sends }
+end
+
+local function op_load_sample_rs5k(cmd)
+  local track_name = cmd.track
+  local sample_path = cmd.sample_path
+  if not track_name then return { status = "error", errors = {"Missing track"} } end
+  if not sample_path then return { status = "error", errors = {"Missing sample_path"} } end
+
+  local tr, _ = resolve_track(track_name)
+  if not tr then return { status = "error", errors = {"Track not found: " .. tostring(track_name)} } end
+
+  local _, actual_name = reaper.GetTrackName(tr)
+
+  reaper.Undo_BeginBlock()
+  local fx_idx, err = _load_rs5k(
+    tr, sample_path, cmd.note,
+    cmd.attack, cmd.decay, cmd.sustain, cmd.release,
+    cmd.volume, cmd.fx_index
+  )
+  reaper.Undo_EndBlock("Load RS5k sample", -1)
+
+  if not fx_idx then
+    return { status = "error", errors = {err}, track = actual_name }
+  end
+  local result = { status = "ok", track = actual_name, fx_index = fx_idx }
+  if err then result.warnings = {err} end
+  return result
+end
+
+local function op_setup_reagate_midi(cmd)
+  local track_name = cmd.track
+  if not track_name then return { status = "error", errors = {"Missing track"} } end
+
+  local tr, _ = resolve_track(track_name)
+  if not tr then return { status = "error", errors = {"Track not found: " .. tostring(track_name)} } end
+
+  local _, actual_name = reaper.GetTrackName(tr)
+
+  reaper.Undo_BeginBlock()
+  local fx_idx, err = _setup_reagate(
+    tr, cmd.threshold, cmd.attack, cmd.hold, cmd.release,
+    cmd.midi_note, cmd.midi_channel, cmd.fx_index
+  )
+  reaper.Undo_EndBlock("Setup ReaGate MIDI", -1)
+
+  if not fx_idx then
+    return { status = "error", errors = {err}, track = actual_name }
+  end
+  local result = { status = "ok", track = actual_name, fx_index = fx_idx }
+  if err then result.warnings = {err} end
+  return result
+end
+
+local function op_set_track_folder(cmd)
+  local track_name = cmd.track
+  local depth = cmd.depth
+  if not track_name then return { status = "error", errors = {"Missing track"} } end
+  if depth == nil then return { status = "error", errors = {"Missing depth"} } end
+
+  local tr, _ = resolve_track(track_name)
+  if not tr then return { status = "error", errors = {"Track not found: " .. tostring(track_name)} } end
+
+  local _, actual_name = reaper.GetTrackName(tr)
+
+  reaper.Undo_BeginBlock()
+  reaper.SetMediaTrackInfo_Value(tr, "I_FOLDERDEPTH", depth)
+  reaper.Undo_EndBlock("Set folder depth: " .. actual_name, -1)
+
+  return { status = "ok", track = actual_name, depth = depth }
+end
+
+local function op_set_track_visible(cmd)
+  local track_name = cmd.track
+  if not track_name then return { status = "error", errors = {"Missing track"} } end
+
+  local tr, _ = resolve_track(track_name)
+  if not tr then return { status = "error", errors = {"Track not found: " .. tostring(track_name)} } end
+
+  local _, actual_name = reaper.GetTrackName(tr)
+  local tcp = cmd.tcp
+  local mixer = cmd.mixer
+
+  reaper.Undo_BeginBlock()
+  if tcp ~= nil then
+    reaper.SetMediaTrackInfo_Value(tr, "B_SHOWINTCP", tcp and 1 or 0)
+  end
+  if mixer ~= nil then
+    reaper.SetMediaTrackInfo_Value(tr, "B_SHOWINMIXER", mixer and 1 or 0)
+  end
+  reaper.TrackList_AdjustWindows(false)
+  reaper.Undo_EndBlock("Set track visibility: " .. actual_name, -1)
+
+  return { status = "ok", track = actual_name }
+end
+
+local function op_drum_augment(cmd)
+  local audio_track = cmd.audio_track
+  local sample_path = cmd.sample_path
+  if not audio_track then return { status = "error", errors = {"Missing audio_track"} } end
+  if not sample_path then return { status = "error", errors = {"Missing sample_path"} } end
+
+  -- Validate sample file before doing anything
+  if not file_exists(sample_path) then
+    return { status = "error", errors = {"Sample file not found: " .. sample_path} }
+  end
+
+  -- Use strict matching to avoid ambiguity
+  local src_tr, src_idx, find_err = find_track_strict(audio_track)
+  if not src_tr then
+    return { status = "error", errors = {find_err} }
+  end
+
+  local _, src_name = reaper.GetTrackName(src_tr)
+
+  -- Determine MIDI note
+  local midi_note = pick_midi_note(cmd.drum_type, cmd.note)
+
+  reaper.Undo_BeginBlock()
+
+  -- 1. Create RS5k track (insert after audio track)
+  local new_idx = src_idx + 1
+  reaper.InsertTrackAtIndex(new_idx, true)
+  local rs5k_tr = reaper.GetTrack(0, new_idx)
+  if not rs5k_tr then
+    reaper.Undo_EndBlock("Drum augment (failed)", -1)
+    return { status = "error", errors = {"Failed to create RS5k track"} }
+  end
+  local rs5k_name = src_name .. " [RS5k]"
+  reaper.GetSetMediaTrackInfo_String(rs5k_tr, "P_NAME", rs5k_name, true)
+
+  -- 2. Load RS5k with sample
+  -- Default release ~250ms (normalized ~0.016 based on RS5k's param range)
+  -- Release must be >= Decay or the sound cuts off prematurely
+  local rs5k_release = cmd.release or 0.02
+  local fx_idx, rs5k_err = _load_rs5k(
+    rs5k_tr, sample_path, midi_note,
+    cmd.attack, cmd.decay, cmd.sustain, rs5k_release,
+    cmd.volume, nil
+  )
+  if not fx_idx then
+    reaper.Undo_EndBlock("Drum augment (failed)", -1)
+    return { status = "error", errors = {"RS5k setup failed: " .. tostring(rs5k_err)} }
+  end
+
+  -- 3. Setup ReaGate on audio track for MIDI triggering
+  -- Re-resolve audio track since indices shifted after insert
+  src_tr = reaper.GetTrack(0, src_idx)
+  -- Default threshold ~-12.5dB (normalized ~0.35) — reasonable for most drum recordings
+  local threshold = cmd.threshold or 0.35
+  local gate_idx, gate_err = _setup_reagate(
+    src_tr, threshold, cmd.gate_attack, cmd.gate_hold, cmd.gate_release,
+    midi_note, nil, nil
+  )
+
+  -- 4. Create MIDI-only send from audio track -> RS5k track
+  -- Re-resolve rs5k track (index may be new_idx)
+  rs5k_tr = reaper.GetTrack(0, new_idx)
+  local send_idx, send_err = _create_send(src_tr, rs5k_tr, "midi", -1, nil)
+
+  -- 5. Optional folder organization
+  if cmd.create_folder then
+    -- Make audio track a folder parent
+    reaper.SetMediaTrackInfo_Value(src_tr, "I_FOLDERDEPTH", 1)
+    -- Make RS5k track the last child (close folder)
+    reaper.SetMediaTrackInfo_Value(rs5k_tr, "I_FOLDERDEPTH", -1)
+  end
+
+  -- 6. Refresh UI
+  reaper.TrackList_AdjustWindows(false)
+
+  reaper.Undo_EndBlock("Drum augment: " .. src_name, -1)
+
+  -- Build result
+  local warnings = {}
+  if rs5k_err then warnings[#warnings + 1] = "RS5k: " .. rs5k_err end
+  if gate_err then warnings[#warnings + 1] = "ReaGate: " .. gate_err end
+  if send_err then warnings[#warnings + 1] = "Send: " .. send_err end
+
+  return {
+    status = #warnings > 0 and "partial" or "ok",
+    audio_track = src_name,
+    rs5k_track = rs5k_name,
+    rs5k_track_index = new_idx,
+    midi_note = midi_note,
+    reagate_fx_index = gate_idx,
+    rs5k_fx_index = fx_idx,
+    send_index = send_idx,
+    warnings = warnings,
+  }
+end
+
+-- ---------------------------------------------------------------------------
 -- Command dispatcher
 -- ---------------------------------------------------------------------------
 
@@ -812,6 +1413,20 @@ local function dispatch(cmd)
     return op_set_envelope_points(cmd)
   elseif op == "clear_envelope" then
     return op_clear_envelope(cmd)
+  elseif op == "add_send" then
+    return op_add_send(cmd)
+  elseif op == "get_sends" then
+    return op_get_sends(cmd)
+  elseif op == "load_sample_rs5k" then
+    return op_load_sample_rs5k(cmd)
+  elseif op == "setup_reagate_midi" then
+    return op_setup_reagate_midi(cmd)
+  elseif op == "set_track_folder" then
+    return op_set_track_folder(cmd)
+  elseif op == "set_track_visible" then
+    return op_set_track_visible(cmd)
+  elseif op == "drum_augment" then
+    return op_drum_augment(cmd)
   else
     return { status = "error", errors = {"Unknown operation: " .. tostring(op)} }
   end

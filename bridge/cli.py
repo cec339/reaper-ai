@@ -8,9 +8,11 @@ from bridge.ipc import send_command
 from bridge.reaper_state import (
     format_apply_result,
     format_context,
+    format_drum_augment,
     format_envelope,
     format_envelope_result,
     format_presets,
+    format_sends,
     format_track_fx,
 )
 
@@ -150,6 +152,121 @@ def cmd_clear_envelope(args):
         sys.exit(1)
 
 
+def cmd_add_send(args):
+    """Create a send between two tracks."""
+    result = send_command(
+        "add_send",
+        src_track=args.src_track,
+        dest_track=args.dest_track,
+        send_type=args.type,
+        midi_channel=args.midi_channel,
+        audio_volume=args.volume,
+    )
+    if result.get("status") == "ok":
+        print(f"Send created (index {result.get('send_index')})")
+    else:
+        errors = result.get("errors", ["Unknown error"])
+        print(f"Error: {'; '.join(errors)}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_get_sends(args):
+    """List sends from a track."""
+    result = send_command("get_sends", track=args.track)
+    if result.get("status") == "ok":
+        print(format_sends(result))
+    else:
+        errors = result.get("errors", ["Unknown error"])
+        print(f"Error: {'; '.join(errors)}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_load_sample_rs5k(args):
+    """Load a sample into RS5k on a track."""
+    kwargs = {"track": args.track, "sample_path": args.sample_path, "note": args.note}
+    if args.fx_index is not None:
+        kwargs["fx_index"] = args.fx_index
+    result = send_command("load_sample_rs5k", **kwargs)
+    status = result.get("status")
+    if status in ("ok", "partial"):
+        print(f"RS5k loaded on '{result.get('track')}' (FX index {result.get('fx_index')})")
+        for w in result.get("warnings", []):
+            print(f"  Warning: {w}", file=sys.stderr)
+    else:
+        errors = result.get("errors", ["Unknown error"])
+        print(f"Error: {'; '.join(errors)}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_setup_reagate(args):
+    """Setup ReaGate for MIDI triggering."""
+    kwargs = {"track": args.track}
+    if args.midi_note is not None:
+        kwargs["midi_note"] = args.midi_note
+    if args.threshold is not None:
+        kwargs["threshold"] = args.threshold
+    if args.fx_index is not None:
+        kwargs["fx_index"] = args.fx_index
+    result = send_command("setup_reagate_midi", **kwargs)
+    status = result.get("status")
+    if status in ("ok", "partial"):
+        print(f"ReaGate configured on '{result.get('track')}' (FX index {result.get('fx_index')})")
+        for w in result.get("warnings", []):
+            print(f"  Warning: {w}", file=sys.stderr)
+    else:
+        errors = result.get("errors", ["Unknown error"])
+        print(f"Error: {'; '.join(errors)}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_set_track_folder(args):
+    """Set folder depth on a track."""
+    result = send_command("set_track_folder", track=args.track, depth=args.depth)
+    if result.get("status") == "ok":
+        print(f"Folder depth set to {args.depth} on '{result.get('track')}'")
+    else:
+        errors = result.get("errors", ["Unknown error"])
+        print(f"Error: {'; '.join(errors)}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_set_track_visible(args):
+    """Set track visibility."""
+    kwargs = {"track": args.track}
+    if args.tcp is not None:
+        kwargs["tcp"] = args.tcp
+    if args.mixer is not None:
+        kwargs["mixer"] = args.mixer
+    result = send_command("set_track_visible", **kwargs)
+    if result.get("status") == "ok":
+        print(f"Visibility updated for '{result.get('track')}'")
+    else:
+        errors = result.get("errors", ["Unknown error"])
+        print(f"Error: {'; '.join(errors)}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_drum_augment(args):
+    """SSD-style drum augment/replace."""
+    kwargs = {"audio_track": args.audio_track, "sample_path": args.sample_path}
+    if args.note is not None:
+        kwargs["note"] = args.note
+    if args.drum_type is not None:
+        kwargs["drum_type"] = args.drum_type
+    if args.threshold is not None:
+        kwargs["threshold"] = args.threshold
+    if args.create_folder:
+        kwargs["create_folder"] = True
+    result = send_command("drum_augment", **kwargs)
+    status = result.get("status")
+    if status in ("ok", "partial"):
+        print(format_drum_augment(result))
+    else:
+        errors = result.get("errors", ["Unknown error"])
+        print(f"Error: {'; '.join(errors)}", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_apply(args):
     """Send a plan JSON file to REAPER."""
     try:
@@ -247,6 +364,53 @@ def main():
 
     sub.add_parser("apply-stdin", help="Read plan JSON from stdin")
 
+    p_add_send = sub.add_parser("add-send", help="Create a send between two tracks")
+    p_add_send.add_argument("src_track", help="Source track name or index")
+    p_add_send.add_argument("dest_track", help="Destination track name or index")
+    p_add_send.add_argument("--type", default="both", choices=["audio", "midi", "both"],
+                            help="Send type (default: both)")
+    p_add_send.add_argument("--midi-channel", type=int, default=-1,
+                            help="MIDI channel (-1=all, 0-15)")
+    p_add_send.add_argument("--volume", type=float, default=1.0,
+                            help="Audio volume (linear, 1.0=0dB)")
+
+    p_get_sends = sub.add_parser("get-sends", help="List sends from a track")
+    p_get_sends.add_argument("track", help="Track name or index")
+
+    p_rs5k = sub.add_parser("load-sample-rs5k", help="Load sample into RS5k")
+    p_rs5k.add_argument("track", help="Track name or index")
+    p_rs5k.add_argument("sample_path", help="Path to sample file")
+    p_rs5k.add_argument("--note", type=int, default=60, help="MIDI note (0-127, default 60)")
+    p_rs5k.add_argument("--fx-index", type=int, default=None,
+                        help="Existing RS5k FX index to update")
+
+    p_reagate = sub.add_parser("setup-reagate", help="Setup ReaGate for MIDI triggering")
+    p_reagate.add_argument("track", help="Track name or index")
+    p_reagate.add_argument("--midi-note", type=int, help="MIDI note (0-127)")
+    p_reagate.add_argument("--threshold", type=float, help="Gate threshold (normalized 0-1)")
+    p_reagate.add_argument("--fx-index", type=int, default=None,
+                           help="Existing ReaGate FX index to update")
+
+    p_folder = sub.add_parser("set-track-folder", help="Set folder depth on a track")
+    p_folder.add_argument("track", help="Track name or index")
+    p_folder.add_argument("depth", type=int, help="Folder depth (1=parent, 0=normal, -1=end)")
+
+    p_vis = sub.add_parser("set-track-visible", help="Set track visibility")
+    p_vis.add_argument("track", help="Track name or index")
+    p_vis.add_argument("--tcp", type=bool, default=None, help="Show in TCP")
+    p_vis.add_argument("--mixer", type=bool, default=None, help="Show in mixer")
+
+    p_drum = sub.add_parser("drum-augment", help="SSD-style drum augment/replace")
+    p_drum.add_argument("audio_track", help="Audio track name or index")
+    p_drum.add_argument("sample_path", help="Path to replacement sample")
+    p_drum.add_argument("--note", type=int, default=None, help="MIDI note (0-127)")
+    p_drum.add_argument("--drum-type", default=None,
+                        help="Drum type hint: kick, snare, hihat, crash, ride, etc.")
+    p_drum.add_argument("--threshold", type=float, default=None,
+                        help="ReaGate threshold (normalized 0-1)")
+    p_drum.add_argument("--create-folder", action="store_true",
+                        help="Organize into a folder")
+
     args = parser.parse_args()
 
     commands = {
@@ -262,6 +426,13 @@ def main():
         "clear-envelope": cmd_clear_envelope,
         "apply": cmd_apply,
         "apply-stdin": cmd_apply_stdin,
+        "add-send": cmd_add_send,
+        "get-sends": cmd_get_sends,
+        "load-sample-rs5k": cmd_load_sample_rs5k,
+        "setup-reagate": cmd_setup_reagate,
+        "set-track-folder": cmd_set_track_folder,
+        "set-track-visible": cmd_set_track_visible,
+        "drum-augment": cmd_drum_augment,
     }
     commands[args.command](args)
 
