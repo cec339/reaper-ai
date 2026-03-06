@@ -39,8 +39,15 @@ def get_timeout() -> float:
     return float(cfg.get("timeout", DEFAULT_TIMEOUT))
 
 
-def send_command(op: str, **kwargs) -> dict:
-    """Send a command to the REAPER daemon and wait for its response."""
+def send_command(op: str, timeout: float | None = None, **kwargs) -> dict:
+    """Send a command to the REAPER daemon and wait for its response.
+
+    Args:
+        op: The operation name (e.g. "get_context", "analyze_track").
+        timeout: Override the default timeout in seconds. Pass a longer value
+                 for slow operations like spectral analysis (e.g. 120).
+        **kwargs: Additional fields merged into the command JSON.
+    """
     queue = get_queue_path()
     in_dir = queue / "in"
     out_dir = queue / "out"
@@ -56,11 +63,11 @@ def send_command(op: str, **kwargs) -> dict:
         json.dump(cmd, f)
 
     # Poll for response
-    timeout = get_timeout()
+    effective_timeout = timeout if timeout is not None else get_timeout()
     resp_file = out_dir / f"{cmd_id}.json"
     start = time.time()
 
-    while time.time() - start < timeout:
+    while time.time() - start < effective_timeout:
         if resp_file.exists():
             # Small delay to ensure file is fully written
             time.sleep(0.05)
@@ -81,7 +88,7 @@ def send_command(op: str, **kwargs) -> dict:
         "id": cmd_id,
         "status": "error",
         "errors": [
-            f"Timeout after {timeout}s waiting for REAPER response. "
+            f"Timeout after {effective_timeout}s waiting for REAPER response. "
             "Is the daemon running? (Actions > Run reaper_daemon.lua)"
         ],
     }

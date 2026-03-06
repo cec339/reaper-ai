@@ -1,5 +1,10 @@
 """Format REAPER state responses for display."""
 
+BAND_LABELS = [
+    "Sub", "Bass", "Low-Mid", "Lower-Mid", "Mid", "Upper-Mid",
+    "Low Presence", "High Presence", "Brilliance", "Air",
+]
+
 
 def format_context(data: dict) -> str:
     """Format get_context response into readable text."""
@@ -142,10 +147,14 @@ def format_apply_result(data: dict) -> str:
         lines.append("Confirmed params:")
         for c in confirmed:
             disp = c.get("display", "")
+            req = c.get("requested", c.get("value"))
+            actual = c.get("value", req)
+            drift = abs(actual - req) if isinstance(actual, (int, float)) and isinstance(req, (int, float)) else 0
+            warn = "  ** DRIFT" if drift > 0.005 else ""
             if disp:
-                lines.append(f"  {c['name']}: {c['value']:.4f} ({disp})")
+                lines.append(f"  {c['name']}: {disp}{warn}")
             else:
-                lines.append(f"  {c['name']}: {c['value']:.4f}")
+                lines.append(f"  {c['name']}: {actual:.4f}{warn}")
 
     if errors:
         lines.append(f"Errors ({len(errors)}):")
@@ -210,5 +219,221 @@ def format_drum_augment(data: dict) -> str:
         lines.append(f"Warnings ({len(warnings)}):")
         for w in warnings:
             lines.append(f"  - {w}")
+
+    return "\n".join(lines)
+
+
+def format_spectral_analysis(data: dict) -> str:
+    """Format analyze_track response into a readable spectral table."""
+    lines = []
+    track = data.get("track", "?")
+    bands = data.get("bands", [])
+    frames = data.get("frames", 0)
+    sr = data.get("sample_rate", 0)
+
+    lines.append(f"Spectral Analysis: '{track}'")
+    lines.append(f"  Frames: {frames}, Sample Rate: {sr}")
+    lines.append("=" * 60)
+    lines.append(f"  {'Band':<12} {'Range':>14}  {'Mono dB':>8}  {'L dB':>8}  {'R dB':>8}")
+    lines.append("  " + "-" * 56)
+
+    for i, band in enumerate(bands):
+        label = BAND_LABELS[i] if i < len(BAND_LABELS) else f"Band {i}"
+        lo = band.get("lo", 0)
+        hi = band.get("hi", 0)
+        avg = band.get("avg_db", -120)
+        avg_l = band.get("avg_db_l", -120)
+        avg_r = band.get("avg_db_r", -120)
+        freq_range = f"{lo:>5}-{hi:<5} Hz"
+        lines.append(
+            f"  {label:<12} {freq_range:>14}  {avg:>8.1f}  {avg_l:>8.1f}  {avg_r:>8.1f}"
+        )
+
+    return "\n".join(lines)
+
+
+def format_auto_eq_result(data: dict) -> str:
+    """Format auto_eq result into a summary of cuts per track."""
+    lines = []
+    status = data.get("status", "unknown")
+    priority = data.get("priority_track", "")
+    mode = data.get("mode", "")
+
+    if mode == "auto_eq_sections":
+        sec_summaries = data.get("sections", [])
+        tw = data.get("tracks_written", 0)
+        strat = data.get("strategy", "subtractive")
+        lines.append(
+            f"Section EQ automation written: {len(sec_summaries)} sections, "
+            f"{tw} tracks (strategy: {strat})"
+        )
+        for ss in sec_summaries:
+            lines.append(
+                f"  {ss.get('label', '?')} "
+                f"({ss.get('start', 0):.0f}s-{ss.get('end', 0):.0f}s): "
+                f"{ss.get('eq_count', 0)} tracks EQ'd"
+            )
+    elif mode == "auto_eq_compl":
+        family = data.get("family_requested", "all")
+        lines.append(f"Auto-EQ Complementary (family: '{family}')")
+    elif priority:
+        lines.append(f"Auto-EQ (priority: '{priority}')")
+    else:
+        strat = data.get("strategy", "subtractive")
+        if strat == "hybrid":
+            lines.append("Auto-EQ All (hybrid: cuts + complementary boosts)")
+        else:
+            lines.append("Auto-EQ All")
+        resolved_level = data.get("level_resolved")
+        if resolved_level:
+            lines.append(f"Level: {resolved_level}")
+    lines.append(f"Status: {status}")
+    audit_path = data.get("audit_path")
+    if audit_path:
+        lines.append(f"Audit: {audit_path}")
+    preflight = data.get("preflight")
+    if isinstance(preflight, dict):
+        lines.append(
+            "Preflight: "
+            f"snapshot={preflight.get('snapshot_count', 0)}, "
+            f"bypassed={preflight.get('bypassed_total', 0)}, "
+            f"restored={preflight.get('restored_applied', 0)}, "
+            f"status={preflight.get('status', 'unknown')}"
+        )
+    lines.append("=" * 60)
+
+    for r in data.get("results", []):
+        track = r.get("track", "?")
+        cuts = r.get("cuts", [])
+        boosts = r.get("boosts", [])
+        msg = r.get("message", "")
+        moves = r.get("moves", [])
+        merge_conflicts = r.get("merge_conflicts", [])
+        family = r.get("family")
+        role = r.get("role")
+
+        higher_priority = r.get("higher_priority_tracks", r.get("yielding_to", []))
+        priority_line = (
+            f"    Higher-priority refs: {', '.join(higher_priority)}"
+            if higher_priority else ""
+        )
+
+        if msg:
+            lines.append(f"\n  {track}: {msg}")
+        elif moves:
+            lines.append(f"\n  {track}:")
+            if family or role:
+                lines.append(f"    Family/Role: {family or '?'} / {role or '?'}")
+            if priority_line:
+                lines.append(priority_line)
+            for m in moves:
+                lo = m.get("lo", 0)
+                hi = m.get("hi", 0)
+                db = m.get("gain_db", 0.0)
+                bi = m.get("band_index", 0)
+                label = BAND_LABELS[bi] if bi < len(BAND_LABELS) else f"Band {bi}"
+                action = "cut" if db < 0 else "boost"
+                contributors = m.get("contributors", [])
+                contrib_suffix = (
+                    f" (contributors: {', '.join(contributors)})"
+                    if contributors and action == "cut" else ""
+                )
+                lines.append(
+                    f"    {label:<12} {lo:>5}-{hi:<5} Hz  {db:>+5.1f} dB ({action}){contrib_suffix}"
+                )
+            if merge_conflicts:
+                lines.append(
+                    f"    Note: {len(merge_conflicts)} move(s) collapsed by 10->5 band mapping; see audit"
+                )
+        elif cuts or boosts:
+            lines.append(f"\n  {track}:")
+            if priority_line:
+                lines.append(priority_line)
+            for c in cuts:
+                lo = c.get("lo", 0)
+                hi = c.get("hi", 0)
+                db = c.get("cut_db", 0)
+                bi = c.get("band_index", 0)
+                label = BAND_LABELS[bi] if bi < len(BAND_LABELS) else f"Band {bi}"
+                contributors = c.get("contributors", [])
+                contrib_suffix = (
+                    f"  (contributors: {', '.join(contributors)})"
+                    if contributors else ""
+                )
+                lines.append(
+                    f"    {label:<12} {lo:>5}-{hi:<5} Hz  {db:>+.1f} dB{contrib_suffix}"
+                )
+            for b in boosts:
+                bi = b.get("band_index", 0)
+                label = BAND_LABELS[bi] if bi < len(BAND_LABELS) else f"Band {bi}"
+                db = b.get("gain_db", 0)
+                lines.append(
+                    f"    {label:<12} {db:>+.1f} dB  (boost, pressure-scaled)"
+                )
+        else:
+            lines.append(f"\n  {track}: No cuts applied")
+
+        apply_status = r.get("apply_status", "")
+        if apply_status:
+            lines.append(f"    Apply status: {apply_status}")
+        makeup_db = r.get("makeup_applied_db", r.get("makeup_db", 0.0))
+        if isinstance(makeup_db, (int, float)) and makeup_db > 0:
+            lines.append(f"    Makeup gain: +{makeup_db:.1f} dB")
+        makeup_unapplied = r.get("makeup_unapplied_db", 0.0)
+        if isinstance(makeup_unapplied, (int, float)) and makeup_unapplied > 0.05:
+            lines.append(f"    Makeup capped: +{makeup_unapplied:.1f} dB unapplied")
+        makeup_policy = r.get("makeup_policy")
+        if makeup_policy and makeup_policy not in {"off", ""}:
+            lines.append(f"    Makeup policy: {makeup_policy}")
+        apply_errors = r.get("apply_errors", [])
+        if apply_errors:
+            lines.append("    Apply errors:")
+            for e in apply_errors:
+                lines.append(f"      - {e}")
+
+    # Complementary boost results (hybrid auto-eq-all)
+    compl_results = data.get("compl_results", [])
+    if compl_results:
+        lines.append("")
+        lines.append("Complementary Boosts:")
+        lines.append("-" * 40)
+        for r in compl_results:
+            track = r.get("track", "?")
+            fam = r.get("family", "?")
+            role = r.get("role", "?")
+            moves = r.get("moves", [])
+            msg = r.get("message", "")
+
+            if msg:
+                lines.append(f"\n  {track} ({fam}/{role}): {msg}")
+            elif moves:
+                lines.append(f"\n  {track} ({fam}/{role}):")
+                for m in moves:
+                    lo = m.get("lo", 0)
+                    hi = m.get("hi", 0)
+                    db = m.get("gain_db", 0.0)
+                    bi = m.get("band_index", 0)
+                    label = BAND_LABELS[bi] if bi < len(BAND_LABELS) else f"Band {bi}"
+                    action = "cut" if db < 0 else "boost"
+                    lines.append(
+                        f"    {label:<12} {lo:>5}-{hi:<5} Hz  {db:>+5.1f} dB ({action})"
+                    )
+            else:
+                lines.append(f"\n  {track} ({fam}/{role}): No moves")
+
+            apply_status = r.get("apply_status", "")
+            if apply_status:
+                lines.append(f"    Apply status: {apply_status}")
+            apply_errors = r.get("apply_errors", [])
+            if apply_errors:
+                lines.append("    Apply errors:")
+                for e in apply_errors:
+                    lines.append(f"      - {e}")
+
+    errors = data.get("errors", [])
+    if errors:
+        lines.append(f"\nErrors ({len(errors)}):")
+        for e in errors:
+            lines.append(f"  - {e}")
 
     return "\n".join(lines)
