@@ -35,13 +35,15 @@ DEFAULT_PRIORITY = [
     ("kick", 0.9), ("snare", 0.85), ("clap", 0.85),
     ("bass", 0.8),
     ("tom", 0.78), ("floor tom", 0.78), ("rack tom", 0.78),
-    ("overhead", 0.72), ("oh", 0.72), ("room", 0.72),
-    ("hihat", 0.68), ("hi hat", 0.68), ("hat", 0.68),
-    ("ride", 0.68), ("crash", 0.68), ("cymbal", 0.68),
-    ("perc", 0.62), ("shaker", 0.62), ("tamb", 0.62),
-    ("drum", 0.7), ("piano", 0.65), ("keys", 0.6),
-    ("guitar", 0.55), ("gtr", 0.55), ("synth", 0.5),
-    ("pad", 0.4), ("string", 0.4), ("fx", 0.3),
+    ("overhead", 0.72), ("oh", 0.72), ("room", 0.70),
+    ("drum", 0.68),
+    ("piano", 0.65), ("keys", 0.62),
+    ("guitar", 0.60), ("gtr", 0.60),
+    ("synth", 0.57),
+    ("hihat", 0.55), ("hi hat", 0.55), ("hat", 0.55),
+    ("ride", 0.54), ("crash", 0.53), ("cymbal", 0.53),
+    ("perc", 0.52), ("shaker", 0.52), ("tamb", 0.52),
+    ("pad", 0.40), ("string", 0.40), ("fx", 0.30),
 ]
 
 # --- Mode-specific defaults ---
@@ -73,17 +75,28 @@ PRIORITY_REFERENCE_ACTIVE_FLOOR_DB = -35.0
 PRIORITY_LANE_GAP_DB = 22.0
 PRIORITY_LANE_FLOOR_DB = -55.0
 
+# Spectral importance: minimum scaling for cut depth after gating passes.
+# Bands that pass the importance gate still get their cut depth scaled by
+# importance, but never below this floor (avoids near-zero cuts on bands
+# that legitimately passed gating with moderate importance).
+IMPORTANCE_DEPTH_FLOOR = 0.3
+
 # Per-band contributor attribution in section summaries
 CONTRIBUTOR_NEAR_MAX_DB = 3.0
 CONTRIBUTOR_MAX_TRACKS = 3
 
 # Makeup gain guardrails
 MAKEUP_MIN_DB = 0.1
-MAKEUP_BIAS = 1.5
-MAKEUP_FLOOR_DB = 1.2
+MAKEUP_BIAS = 1.2
+MAKEUP_FLOOR_DB = 0.6
 MAKEUP_TOTAL_CAP_DB = 2.5
-MAKEUP_PER_BAND_CAP_DB = 2.5
+MAKEUP_PER_BAND_CAP_DB = 1.8
 MAKEUP_MAX_DB = MAKEUP_TOTAL_CAP_DB  # Backward-compatible alias.
+
+# Makeup importance weighting — decoupled from lane/masking constants so
+# retuning PRIORITY_LANE_* doesn't accidentally change makeup behaviour.
+MAKEUP_IMPORTANCE_GAP_DB = 30.0    # wider than PRIORITY_LANE_GAP_DB (22)
+MAKEUP_IMPORTANCE_FLOOR_DB = -60.0  # more generous than PRIORITY_LANE_FLOOR_DB (-55)
 
 VOLUME_FLOOR_DB = -80.0  # Skip tracks whose volume envelope is below this during the section
 
@@ -94,7 +107,7 @@ CALIBRATION_TIMEOUT = 30
 PREFLIGHT_TIMEOUT = 15
 
 # Complementary mode defaults / guardrails
-SUPPORTED_COMPL_FAMILIES = {"all", "guitar", "keys-synth", "vocal"}
+SUPPORTED_COMPL_FAMILIES = {"all", "guitar", "keys-synth", "vocal", "cymbal"}
 COMPL_MAX_MOVES = 4
 COMPL_MAX_BOOST_BANDS = 1
 COMPL_MAX_BOOST_DB = 6.0
@@ -108,13 +121,30 @@ COMPL_BOOST_SCALE = 1.0
 COMPL_OWNERSHIP_BOOST_DB = 6.0  # Full boost on target bands even when not deficit
 COMPL_OWNERSHIP_THRESHOLD_DB = 1.0  # Skip ownership boost if already well above mean
 COMPL_SUPPORT_CUT_SCALE = 0.75  # Support role gets heavier cuts (vs 0.5 normal)
+COMPL_SUPPORT_BOOST_SCALE = 0.5  # Support fallback boosts at 50% magnitude
+COMPL_SUPPORT_MAX_BOOST_DB = 3.0  # Hard ceiling on support boosts; deficit-path slope alone can otherwise reach the anchor max
 COMPL_BOOST_BW_OCT = 0.5  # Narrower bandwidth for complementary boosts (default preset = 1.0)
 COMPL_CUT_BW_OCT = 1.0    # Bandwidth for complementary/masking cuts (keep preset default)
+COMPL_INTRA_FAMILY_SPREAD = 0.6  # Max fraction of band width (log2) for intra-family boost spreading
+
+# Anti-refill guard: block complementary boosts in bands the subtractive pass cleared
+# across multiple tracks. Prevents the boost pass from undoing mix-wide cuts.
+COMPL_ANTI_REFILL_MIN_CUTS = 2     # Block if a band took cuts on this many tracks
+COMPL_ANTI_REFILL_MIN_TOTAL_DB = 6.0  # OR if cumulative |cut| reaches this magnitude
+
+# Starvation guard: when a track's role-target bands are all blocked, allow one
+# small recovery boost on a non-target band where the track has high relative energy.
+# Keeps cut tracks from losing family identity entirely. Conservative ceilings so
+# recovery cannot undo subtractive work.
+COMPL_STARVATION_FALLBACK_SCALE = 0.5
+COMPL_STARVATION_MAX_DB = 2.5
+COMPL_STARVATION_MIN_DELTA_DB = 4.0
 
 # Inter-family spectral lane assignment
 LANE_DOMINANCE_THRESHOLD_DB = 3.0   # Min dB advantage to claim a band
 LANE_ACTIVITY_FLOOR_DB = -45.0      # Family must have at least one track with peak above this to participate
-LANE_FAMILY_PRIORITY = {"vocal": 3, "guitar": 2, "keys-synth": 1}  # Tie-breaking sort stability only
+COMPL_MEAN_ACTIVITY_FLOOR_DB = -60.0  # Exclude silent tracks from family band mean
+LANE_FAMILY_PRIORITY = {"vocal": 3, "guitar": 2, "keys-synth": 1, "cymbal": 0}  # Tie-breaking sort stability only
 
 ROLE_ALIAS = {
     "body": "anchor",
@@ -129,13 +159,13 @@ ROLE_ALIAS = {
 
 COMPL_ROLE_BANDS = {
     "guitar": {
-        "anchor": {2, 3, 4, 5},
-        "presence": {6, 7},
-        "texture": {8, 9},
+        "anchor": {4, 5, 6, 7},      # core tone: 320-5000 Hz
+        "presence": {7, 8},            # bite/attack: 2500-10k Hz
+        "texture": {8, 9},             # shimmer: 5k-20k Hz
     },
     "keys-synth": {
-        "anchor": {1, 2, 3, 4},
-        "presence": {5, 6, 7},
+        "anchor": {4, 5, 6, 7},       # core tone: 320-5000 Hz
+        "presence": {7, 8},            # definition/sparkle: 2500-10k Hz
         "texture": {8, 9},
     },
     "vocal": {
@@ -143,7 +173,35 @@ COMPL_ROLE_BANDS = {
         "presence": {5, 6, 7},   # intelligibility: 640-5k Hz
         "texture": {8, 9},       # air/breath: 5k-20k Hz
     },
+    "cymbal": {
+        "anchor": {7, 8},        # High Presence + Brilliance (2.5k-10k)
+        "presence": {9},          # Air (10k-20k)
+        "texture": {5, 6},       # Upper-Mid + Low Presence (640-2.5k)
+    },
 }
+
+# Per-family sub-lane center frequencies for contested bands.
+# Each family targets a characteristic frequency within shared analysis bands,
+# giving spectral separation even when multiple families boost in the same band.
+FAMILY_LANE_FREQ: dict[str, dict[int, float]] = {
+    "guitar":     {4: 380, 5: 750, 6: 1800, 7: 3000, 8: 6500},
+    "keys-synth": {3: 220, 4: 550, 5: 1100, 6: 1400, 7: 4200, 8: 7000, 9: 14000},
+    "vocal":      {3: 250, 4: 500, 5: 800, 6: 1800, 7: 3500},
+    "cymbal":     {5: 900, 6: 2200, 7: 3500, 8: 8000, 9: 12000},
+}
+
+
+def _validate_lane_freqs() -> None:
+    for fam, band_freqs in FAMILY_LANE_FREQ.items():
+        for bi, hz in band_freqs.items():
+            if not (BAND_EDGES[bi] <= hz <= BAND_EDGES[bi + 1]):
+                raise ValueError(
+                    f"FAMILY_LANE_FREQ[{fam!r}][{bi}] = {hz} Hz "
+                    f"outside band [{BAND_EDGES[bi]}, {BAND_EDGES[bi + 1]}] Hz"
+                )
+
+
+_validate_lane_freqs()
 
 
 def _compute_contested_bands() -> dict[int, list[str]]:
@@ -663,11 +721,15 @@ def _name_matches_keyword(name_lower: str, tokens: list[str], keyword: str) -> b
     return keyword in name_lower
 
 
-def match_track_priority(track_name: str) -> float:
+def match_track_priority(track_name: str, parent_name: str | None = None) -> float:
     """Return a priority score (0-1) for a track name based on role keywords.
 
     Uses substring matching for most keywords, but token matching for
     short aliases (vx) to avoid false positives.
+
+    If the track name doesn't match any keyword and *parent_name* is
+    provided, the parent folder's name is used as a fallback so that
+    e.g. "ajmic" inside a "vocals" folder inherits vocal priority.
     """
     name_lower = track_name.lower()
     tokens = _tokenize_name(track_name)
@@ -685,6 +747,11 @@ def match_track_priority(track_name: str) -> float:
     for keyword, priority in DEFAULT_PRIORITY:
         if _name_matches_keyword(name_lower, tokens, keyword):
             return priority
+
+    # Inherit priority from parent folder name if track itself is unknown
+    if parent_name:
+        return match_track_priority(parent_name)
+
     return 0.5  # default mid-priority for unknown tracks
 
 
@@ -1038,6 +1105,9 @@ def _analyze_folder_aggregate(
     time_end: float | None,
     send_command_fn: Callable,
     analysis_cache: dict,
+    *,
+    sample_dur: float | None = None,
+    sample_interval: float | None = None,
 ) -> dict:
     """Analyze a folder/bus track, falling back to child aggregation on silence.
 
@@ -1063,6 +1133,8 @@ def _analyze_folder_aggregate(
         analysis_cache,
         track_index=folder_idx,
         cache_key=folder_idx,
+        sample_dur=sample_dur,
+        sample_interval=sample_interval,
     )
     if direct.get("status") == "ok" and not _is_silent_analysis(direct):
         return direct
@@ -1099,6 +1171,8 @@ def _analyze_folder_aggregate(
             analysis_cache,
             track_index=leaf_idx,
             cache_key=leaf_idx,
+            sample_dur=sample_dur,
+            sample_interval=sample_interval,
         )
         if result.get("status") == "ok":
             ok_results.append(result)
@@ -1134,6 +1208,8 @@ def _cached_analyze_simple(
     *,
     track_index: int | None = None,
     cache_key: int | str | None = None,
+    sample_dur: float | None = None,
+    sample_interval: float | None = None,
 ) -> dict:
     """Analyze a track with caching (standalone helper for reuse).
 
@@ -1144,7 +1220,9 @@ def _cached_analyze_simple(
         key = track_index if track_index is not None else track_name
     if key not in analysis_cache:
         analysis_cache[key] = analyze_track(
-            track_name, time_start, time_end, send_command_fn, track_index=track_index
+            track_name, time_start, time_end, send_command_fn,
+            track_index=track_index,
+            sample_dur=sample_dur, sample_interval=sample_interval,
         )
     return analysis_cache[key]
 
@@ -1189,12 +1267,49 @@ def _make_analysis_progress_logger(
 # Masking computation
 # ---------------------------------------------------------------------------
 
+
+def _compute_spectral_importance(bands: list[dict]) -> list[float]:
+    """Compute per-band importance weights (0-1) for a single track.
+
+    A band is "important" if its energy is within PRIORITY_LANE_GAP_DB of
+    the track's peak AND above PRIORITY_LANE_FLOOR_DB absolute.  Uses
+    max(avg_db, avg_db_l, avg_db_r) per band for stereo correctness.
+
+    Returns list of weights, one per band.  1.0 = near peak, 0.0 = irrelevant.
+    """
+    if not bands:
+        return []
+    energies: list[float] = []
+    for b in bands:
+        vals = [
+            v for v in (b.get("avg_db", -120), b.get("avg_db_l", -120), b.get("avg_db_r", -120))
+            if isinstance(v, (int, float)) and math.isfinite(v)
+        ]
+        energies.append(max(vals) if vals else -120.0)
+
+    peak_db = max(energies)
+    weights: list[float] = []
+    for e in energies:
+        if e < PRIORITY_LANE_FLOOR_DB:
+            weights.append(0.0)
+            continue
+        distance = peak_db - e  # always >= 0
+        if distance <= 0:
+            weights.append(1.0)
+        elif distance >= PRIORITY_LANE_GAP_DB:
+            weights.append(0.0)
+        else:
+            weights.append(1.0 - distance / PRIORITY_LANE_GAP_DB)
+    return weights
+
+
 def _compute_masking_with_details(
     priority_bands: list[dict],
     yield_bands: list[dict],
     max_cut_db: float = -3.0,
     aggressiveness: float = 1.0,
     max_cuts: int = 10,
+    importance_weights: list[float] | None = None,
 ) -> dict:
     """Compute masking cuts and per-band decision details.
 
@@ -1205,6 +1320,10 @@ def _compute_masking_with_details(
         max_cut_db: Maximum cut in dB (negative, e.g. -3.0).
         aggressiveness: Multiplier for cut depth (1.0 = normal).
         max_cuts: Maximum number of cuts to return (deepest first).
+        importance_weights: Optional per-band importance (0-1) from priority
+                           tracks' spectral shape. Bands where no priority
+                           track has significant energy get low importance,
+                           reducing or eliminating cuts on harmonic leakage.
 
     Returns:
         Dict with:
@@ -1280,14 +1399,26 @@ def _compute_masking_with_details(
         decision["overlap_ratio"] = overlap_ratio
         decision["stereo_factor"] = stereo_factor
 
-        # Only cut if significant masking pressure
-        if max_pressure < 1.5:
+        # Spectral importance: weight pressure by how important this band
+        # is to the priority track(s).  Zero importance = harmonic leakage.
+        importance = 1.0
+        if importance_weights and b < len(importance_weights):
+            importance = importance_weights[b]
+        decision["importance"] = importance
+        effective_pressure = max_pressure * importance
+
+        # Only cut if significant masking pressure (importance-weighted)
+        if effective_pressure < 1.5:
             decision["decision"] = "skip"
             decision["reason"] = "pressure_below_threshold"
+            decision["effective_pressure"] = effective_pressure
             band_decisions.append(decision)
             continue
 
-        raw_cut = -k * math.log10(max_pressure)
+        # Cut depth uses floored importance so bands that pass gating
+        # still get a meaningful (not near-zero) cut.
+        depth_importance = max(importance, IMPORTANCE_DEPTH_FLOOR)
+        raw_cut = -k * math.log10(max_pressure * depth_importance)
         clamped_cut = -min(abs(raw_cut), abs(max_cut_db))
         cut = clamped_cut * stereo_factor
         decision["raw_cut_db"] = raw_cut
@@ -1548,8 +1679,83 @@ def _find_reaeq_merge_conflicts(moves: list[dict], calibration: dict) -> list[di
     return conflicts
 
 
+def _sub_lane_freq(family: str, band_index: int, lo: float, hi: float) -> float:
+    """Return the sub-lane center frequency for a family's boost in a band.
+
+    Falls back to geometric mean if no sub-lane is defined.
+    """
+    fam_freqs = FAMILY_LANE_FREQ.get(family)
+    if fam_freqs:
+        override = fam_freqs.get(band_index)
+        if override is not None:
+            return float(override)
+    return math.sqrt(lo * hi)
+
+
+def _spread_intra_family_boosts(family_moves: list[dict]) -> None:
+    """Spread target_hz across tracks boosting in the same family+band.
+
+    When multiple tracks in the same family get a boost in the same analysis
+    band, they would otherwise all land at the identical family center Hz.
+    This mutates ``target_hz`` in-place so each track gets a distinct
+    frequency, logarithmically spaced around the family center.
+
+    Only boost moves with a ``target_hz`` key are affected.
+    """
+    from collections import defaultdict
+
+    by_band: dict[int, list[dict]] = defaultdict(list)
+    for move in family_moves:
+        if move.get("kind") == "boost" and "target_hz" in move:
+            by_band[move["band_index"]].append(move)
+
+    for _band_idx, moves in by_band.items():
+        n = len(moves)
+        if n < 2:
+            continue
+
+        lo = moves[0]["lo"]
+        hi = moves[0]["hi"]
+        center_hz = moves[0]["target_hz"]
+
+        log_lo = math.log2(max(lo, 1.0))
+        log_hi = math.log2(max(hi, 2.0))
+        log_center = math.log2(max(center_hz, 1.0))
+        band_width = log_hi - log_lo
+        if band_width <= 0:
+            continue
+
+        # Asymmetric-safe: usable radius is min distance from center to either edge
+        usable_radius = min(log_center - log_lo, log_hi - log_center)
+        max_half_spread = COMPL_INTRA_FAMILY_SPREAD * band_width * 0.5
+        half_spread = min(usable_radius, max_half_spread)
+
+        # Scale by track count: full spread at 5 tracks
+        half_spread *= min(1.0, (n - 1) / 4.0)
+
+        # Sort by track index for deterministic ordering
+        moves.sort(key=lambda m: m.get("_track_index", 0))
+
+        for i, move in enumerate(moves):
+            if n > 1:
+                offset = half_spread * 2.0 * (i / (n - 1) - 0.5)
+            else:
+                offset = 0.0
+            new_hz = 2 ** (log_center + offset)
+            new_hz = max(lo, min(hi, new_hz))
+            move["target_hz"] = round(new_hz, 1)
+
+
 def _representative_freq(cut: dict) -> float:
-    """Geometric mean of band edges as the representative frequency."""
+    """Representative frequency: family sub-lane override if present, else geometric mean."""
+    hz = cut.get("target_hz")
+    if hz is not None:
+        try:
+            hz = float(hz)
+        except (TypeError, ValueError):
+            hz = None
+        if hz is not None and math.isfinite(hz) and hz > 0:
+            return hz
     return math.sqrt(cut["lo"] * cut["hi"])
 
 
@@ -1602,13 +1808,51 @@ def _eligible_makeup_reaeq_bands(
     return [bi for bi in mapped if 0 <= bi < band_count and bi not in cut_reaeq_indices]
 
 
+def _compute_makeup_importance(bands: list[dict]) -> list[float]:
+    """Per-band importance for makeup weighting, using dedicated constants.
+
+    Same algorithm as ``_compute_spectral_importance`` but with
+    ``MAKEUP_IMPORTANCE_GAP_DB`` / ``MAKEUP_IMPORTANCE_FLOOR_DB`` so that
+    retuning the lane/masking thresholds doesn't change makeup behaviour.
+    """
+    if not bands:
+        return []
+    energies: list[float] = []
+    for b in bands:
+        vals = [
+            v for v in (b.get("avg_db", -120), b.get("avg_db_l", -120), b.get("avg_db_r", -120))
+            if isinstance(v, (int, float)) and math.isfinite(v)
+        ]
+        energies.append(max(vals) if vals else -120.0)
+    peak_db = max(energies)
+    weights: list[float] = []
+    for e in energies:
+        if e < MAKEUP_IMPORTANCE_FLOOR_DB:
+            weights.append(0.0)
+            continue
+        distance = peak_db - e
+        if distance <= 0:
+            weights.append(1.0)
+        elif distance >= MAKEUP_IMPORTANCE_GAP_DB:
+            weights.append(0.0)
+        else:
+            weights.append(1.0 - distance / MAKEUP_IMPORTANCE_GAP_DB)
+    return weights
+
+
 def _compute_selective_makeup_boosts(
     target_makeup_db: float,
     cut_reaeq_indices: set[int],
     calibration: dict,
     per_band_cap_db: float = MAKEUP_PER_BAND_CAP_DB,
+    yield_bands: list[dict] | None = None,
 ) -> tuple[dict[int, float], float, float]:
     """Distribute selective makeup onto uncut ReaEQ bands with caps.
+
+    When *yield_bands* is provided, per-band importance (based on the
+    yield track's own spectral energy) is used to weight the distribution.
+    Bands with no meaningful energy (importance=0) receive zero makeup.
+    When *yield_bands* is ``None``, uniform weighting is used.
 
     Returns:
       (boosts_by_reaeq_band, applied_makeup_db_estimate, unapplied_makeup_db)
@@ -1620,15 +1864,30 @@ def _compute_selective_makeup_boosts(
     if not eligible:
         return {}, 0.0, target_makeup_db
 
+    # --- Build per-ReaEQ-band weights from yield track energy ----------
+    if yield_bands is not None:
+        analysis_importance = _compute_makeup_importance(yield_bands)
+        band_map = _band_to_reaeq_map(calibration)
+        reaeq_importance: dict[int, float] = {}
+        for analysis_idx, imp in enumerate(analysis_importance):
+            reaeq_idx = band_map.get(analysis_idx)
+            if reaeq_idx is not None:
+                ri = int(reaeq_idx)
+                reaeq_importance[ri] = max(reaeq_importance.get(ri, 0.0), imp)
+        weights = {bi: reaeq_importance.get(bi, 0.0) for bi in eligible}
+        # Exclude bands with zero importance
+        eligible = [bi for bi in eligible if weights.get(bi, 0.0) > 0.0]
+        if not eligible:
+            return {}, 0.0, target_makeup_db
+        weights = {bi: weights[bi] for bi in eligible}
+    else:
+        # Uniform fallback — no high-frequency bias
+        weights = {bi: 1.0 for bi in eligible}
+
     # Treat target as average boost intent across eligible bands.
     remaining_budget_db = target_makeup_db * len(eligible)
     boosts = {bi: 0.0 for bi in eligible}
     active = set(eligible)
-    max_rank = max(len(eligible) - 1, 1)
-    weights = {
-        bi: (0.8 + 0.5 * (rank / max_rank))
-        for rank, bi in enumerate(eligible)
-    }
 
     while remaining_budget_db > 1e-9 and active:
         total_weight = sum(weights[bi] for bi in active)
@@ -1672,8 +1931,14 @@ def compute_reaeq_makeup_profile(
     makeup_mode: str = "off",
     allow_selective_makeup: bool = True,
     max_makeup_db: float = MAKEUP_MAX_DB,
+    yield_bands: list[dict] | None = None,
 ) -> dict:
-    """Compute selective makeup profile and per-band boosts for ReaEQ."""
+    """Compute selective makeup profile and per-band boosts for ReaEQ.
+
+    When *yield_bands* is provided, makeup boosts are weighted by the yield
+    track's spectral energy so bands with no meaningful content receive
+    zero makeup.
+    """
     reaeq_cuts = _merge_cuts_to_reaeq(cuts, calibration)
     has_cut = bool(reaeq_cuts)
     raw_makeup_db = _estimate_makeup_db_raw(cuts, calibration) if has_cut else 0.0
@@ -1695,6 +1960,7 @@ def compute_reaeq_makeup_profile(
                 cut_reaeq_indices=set(reaeq_cuts.keys()),
                 calibration=calibration,
                 per_band_cap_db=MAKEUP_PER_BAND_CAP_DB,
+                yield_bands=yield_bands,
             )
         else:
             policy = "hybrid_disabled"
@@ -1756,8 +2022,13 @@ def build_reaeq_gain_moves(
     *,
     makeup_mode: str = "off",
     allow_selective_makeup: bool = True,
+    yield_bands: list[dict] | None = None,
 ) -> tuple[dict[int, float], dict]:
-    """Build final ReaEQ per-band gain moves and makeup metadata."""
+    """Build final ReaEQ per-band gain moves and makeup metadata.
+
+    When *yield_bands* is provided, selective makeup is weighted by the
+    yield track's spectral energy.
+    """
     reaeq_cuts = _merge_cuts_to_reaeq(cuts, calibration)
     gain_moves = {bi: float(cut["cut_db"]) for bi, cut in reaeq_cuts.items()}
     makeup = compute_reaeq_makeup_profile(
@@ -1765,6 +2036,7 @@ def build_reaeq_gain_moves(
         calibration,
         makeup_mode=makeup_mode,
         allow_selective_makeup=allow_selective_makeup,
+        yield_bands=yield_bands,
     )
     for bi, boost_db in makeup["boosts_by_reaeq_band"].items():
         if bi not in gain_moves:
@@ -1894,7 +2166,55 @@ def _classify_compl_family(track_name: str) -> str | None:
     if any(k in name_lower for k in ("vocal", "vox", "voice", "ohno", "bckgr", "bgvox")):
         return "vocal"
 
+    if "room" not in tokens:
+        cymbal_tokens = {"cymbal", "cymbals", "ride", "crash", "hat", "hihat", "hihatraw", "hh", "overhead", "oh"}
+        if any(tok in cymbal_tokens for tok in tokens):
+            return "cymbal"
+        if any(k in name_lower for k in ("cymbal", "hihat", "hi hat", "overhead", "crash")):
+            return "cymbal"
+
     return None
+
+
+def _build_family_map(tracks: list[dict]) -> dict[int, str]:
+    """Map track index -> compl family, inheriting from parent bus if needed.
+
+    MUST be called with the UNFILTERED tracks list from get_context() to
+    preserve folder_depth close markers.  Filtered-out tracks (muted, helper)
+    may carry folder_depth < 0; skipping them would break the stack.
+
+    REAPER folder structure:
+    - is_folder=True: opens a new folder level
+    - folder_depth=-N on a track: closes N folder levels (on the LAST child)
+    """
+    family_map: dict[int, str] = {}
+    folder_stack: list[str | None] = []  # family classification at each nesting level
+
+    for t in tracks:
+        idx = int(t["index"])
+        own_family = _classify_compl_family(t["name"])
+
+        if t.get("is_folder"):
+            # Bus/folder track — classify it, push onto stack.
+            # Inherits from parent if own name doesn't classify.
+            bus_family = own_family or (folder_stack[-1] if folder_stack else None)
+            folder_stack.append(bus_family)
+            if bus_family:
+                family_map[idx] = bus_family
+        else:
+            # Leaf track — own name first, then inherit from parent
+            resolved = own_family or (folder_stack[-1] if folder_stack else None)
+            if resolved:
+                family_map[idx] = resolved
+
+        # Handle folder close (negative depth pops levels).
+        depth = t.get("folder_depth", 0)
+        if depth < 0:
+            for _ in range(abs(depth)):
+                if folder_stack:
+                    folder_stack.pop()
+
+    return family_map
 
 
 def _normalize_role_name(role: str) -> str | None:
@@ -1989,15 +2309,17 @@ def _assign_complementary_roles(
     return roles
 
 
-def _family_band_means(analysis_rows: list[dict]) -> list[float]:
-    """Mean dB per analysis band for a family."""
+def _family_band_means(analysis_rows: list[dict],
+                       activity_floor_db: float = COMPL_MEAN_ACTIVITY_FLOOR_DB) -> list[float]:
+    """Mean dB per analysis band for a family, excluding silent tracks."""
     if not analysis_rows:
         return [-120.0] * (len(BAND_EDGES) - 1)
     num_bands = len(analysis_rows[0]["bands"])
     means = []
     for b in range(num_bands):
         vals = [row["bands"][b].get("avg_db", -120) for row in analysis_rows]
-        means.append(sum(vals) / max(1, len(vals)))
+        active = [v for v in vals if v >= activity_floor_db]
+        means.append(sum(active) / len(active) if active else -120.0)
     return means
 
 
@@ -2140,6 +2462,65 @@ def _assign_spectral_lanes(
     }
 
 
+def _build_anti_refill_aggregate(
+    selected_tracks: list[dict],
+    send_command_fn: Callable,
+    calibration: dict,
+) -> tuple[dict[int, dict[int, float]], dict[int, list[dict]], dict[int, bool], dict[int, dict]]:
+    """Pre-read [AutoEQ] masking state across the whole selection and aggregate.
+
+    Returns four dicts keyed by track index (and one keyed by ReaEQ band index):
+      masking_constraints_by_track: {track_idx: {reaeq_band_idx: cut_db}}
+      preflight_chain_by_track: {track_idx: list of FX chain dicts}
+      preflight_ok_by_track: {track_idx: bool}
+      anti_refill_blocks: {reaeq_band_idx: {"cuts": N, "total_db": X, "tracks": [names]}}
+
+    The aggregate spans every selected target — including singleton/non-family tracks
+    that wouldn't appear in any 2+-member complementary family — so the complementary
+    pass cannot refill bands the subtractive pass cleared anywhere in the mix.
+    """
+    masking_constraints_by_track: dict[int, dict[int, float]] = {}
+    preflight_chain_by_track: dict[int, list[dict]] = {}
+    preflight_ok_by_track: dict[int, bool] = {}
+    anti_refill_blocks: dict[int, dict] = {}
+
+    for t in selected_tracks:
+        try:
+            track_idx = int(t.get("index"))
+        except (TypeError, ValueError):
+            continue
+        track_name = t.get("name") or f"Track {track_idx}"
+
+        preflight_fx = send_command_fn(
+            "get_track_fx", track=track_idx, strict=True, timeout=10
+        )
+        ok = preflight_fx.get("status") == "ok"
+        chain = preflight_fx.get("fx_chain", []) if ok else []
+        constraints: dict[int, float] = {}
+        if ok:
+            constraints = read_masking_constraints(chain, calibration)
+
+        preflight_ok_by_track[track_idx] = ok
+        preflight_chain_by_track[track_idx] = chain
+        masking_constraints_by_track[track_idx] = constraints
+
+        for reaeq_band_idx, cut_db in constraints.items():
+            entry = anti_refill_blocks.setdefault(
+                int(reaeq_band_idx),
+                {"cuts": 0, "total_db": 0.0, "tracks": []},
+            )
+            entry["cuts"] += 1
+            entry["total_db"] += float(cut_db)
+            entry["tracks"].append(track_name)
+
+    return (
+        masking_constraints_by_track,
+        preflight_chain_by_track,
+        preflight_ok_by_track,
+        anti_refill_blocks,
+    )
+
+
 def _compute_complementary_moves_with_details(
     family: str,
     role: str,
@@ -2152,6 +2533,7 @@ def _compute_complementary_moves_with_details(
     band_to_reaeq: dict[int, int] | None = None,
     boost_only: bool = False,
     lane_constraints: dict[int, str] | None = None,
+    anti_refill_blocks: dict[int, dict] | None = None,
 ) -> dict:
     """Compute complementary moves (cuts + boosts) for one track with audit details.
 
@@ -2161,9 +2543,17 @@ def _compute_complementary_moves_with_details(
     boost_only: when True, skip crowding-reduction cuts entirely (hybrid mode).
     lane_constraints: optional dict of analysis band index → owning family name.
     Boosts on lane-blocked bands are skipped (inter-family spectral lane ownership).
+    anti_refill_blocks: optional dict of ReaEQ band index → {"cuts": N, "total_db": X,
+    "tracks": [...]} aggregated across the entire selection. Boosts in bands that
+    absorbed enough mix-wide cuts are blocked so the boost pass cannot refill what
+    the subtractive pass just cleared.
     """
-    # "support" intentionally has no target bands: trim crowding only, no boosts.
+    # Support tracks fall back to anchor bands at reduced magnitude.
     role_targets = COMPL_ROLE_BANDS[family].get(role, set())
+    support_fallback = False
+    if role == "support" and not role_targets:
+        role_targets = COMPL_ROLE_BANDS[family].get("anchor", set())
+        support_fallback = True
     _masking = masking_constraints or {}
     band_map = band_to_reaeq or DEFAULT_BAND_TO_REAEQ
     cut_candidates: list[dict] = []
@@ -2188,6 +2578,7 @@ def _compute_complementary_moves_with_details(
             "delta_db": round(delta_db, 3),
             "role": role,
             "target_band": in_role_target,
+            "support_fallback": support_fallback,
         }
 
         # Non-target bands: trim crowding (skipped in boost_only/hybrid mode).
@@ -2235,9 +2626,31 @@ def _compute_complementary_moves_with_details(
             band_decisions.append(detail)
             continue
 
+        # Anti-refill: block boosts in bands the subtractive pass cleared mix-wide.
+        if (
+            in_role_target
+            and anti_refill_blocks
+            and reaeq_idx_for_band is not None
+            and reaeq_idx_for_band in anti_refill_blocks
+        ):
+            block = anti_refill_blocks[reaeq_idx_for_band]
+            cut_count = block.get("cuts", 0)
+            total_cut_db = abs(block.get("total_db", 0.0))
+            if (
+                cut_count >= COMPL_ANTI_REFILL_MIN_CUTS
+                or total_cut_db >= COMPL_ANTI_REFILL_MIN_TOTAL_DB
+            ):
+                detail["decision"] = "skip_boost"
+                detail["reason"] = "anti_refill"
+                detail["anti_refill_cuts"] = cut_count
+                detail["anti_refill_total_db"] = round(block.get("total_db", 0.0), 2)
+                band_decisions.append(detail)
+                continue
+
         # Target bands: reinforce weak role lanes with guarded boosts.
         if in_role_target and delta_db <= COMPL_DEFICIT_THRESHOLD_DB:
-            boost_db = min(max_boost_db, abs(delta_db) * COMPL_BOOST_SCALE)
+            effective_scale = COMPL_SUPPORT_BOOST_SCALE if support_fallback else COMPL_BOOST_SCALE
+            boost_db = min(max_boost_db, abs(delta_db) * effective_scale)
             if hi <= 80:
                 detail["decision"] = "skip_boost"
                 detail["reason"] = "no_sub_boost"
@@ -2245,6 +2658,8 @@ def _compute_complementary_moves_with_details(
                 continue
             if lo >= 5000:
                 boost_db = min(boost_db, COMPL_HIGH_BAND_BOOST_CAP_DB)
+            if support_fallback:
+                boost_db = min(boost_db, COMPL_SUPPORT_MAX_BOOST_DB)
             if boost_db >= COMPL_MIN_MOVE_DB:
                 move = {
                     "band_index": b,
@@ -2252,18 +2667,20 @@ def _compute_complementary_moves_with_details(
                     "hi": hi,
                     "gain_db": round(boost_db, 2),
                     "kind": "boost",
-                    "reason": "role_reinforcement",
+                    "reason": "support_reinforcement" if support_fallback else "role_reinforcement",
+                    "target_hz": _sub_lane_freq(family, b, lo, hi),
                 }
                 boost_candidates.append(move)
                 detail["decision"] = "candidate_boost"
                 detail["gain_db"] = move["gain_db"]
+                detail["target_hz"] = move.get("target_hz")
                 band_decisions.append(detail)
                 continue
 
         # Target bands: ownership boost even when not deficit.
         # Gives each role a visible bump in its assigned lane.
         if in_role_target and delta_db < COMPL_OWNERSHIP_THRESHOLD_DB:
-            ownership_db = COMPL_OWNERSHIP_BOOST_DB
+            ownership_db = COMPL_OWNERSHIP_BOOST_DB * (COMPL_SUPPORT_BOOST_SCALE if support_fallback else 1.0)
             if hi <= 80:
                 detail["decision"] = "skip_boost"
                 detail["reason"] = "no_sub_boost"
@@ -2271,6 +2688,8 @@ def _compute_complementary_moves_with_details(
                 continue
             if lo >= 5000:
                 ownership_db = min(ownership_db, COMPL_HIGH_BAND_BOOST_CAP_DB)
+            if support_fallback:
+                ownership_db = min(ownership_db, COMPL_SUPPORT_MAX_BOOST_DB)
             if ownership_db >= COMPL_MIN_MOVE_DB:
                 move = {
                     "band_index": b,
@@ -2278,11 +2697,13 @@ def _compute_complementary_moves_with_details(
                     "hi": hi,
                     "gain_db": round(ownership_db, 2),
                     "kind": "boost",
-                    "reason": "role_ownership",
+                    "reason": "support_ownership" if support_fallback else "role_ownership",
+                    "target_hz": _sub_lane_freq(family, b, lo, hi),
                 }
                 boost_candidates.append(move)
                 detail["decision"] = "candidate_boost"
                 detail["gain_db"] = move["gain_db"]
+                detail["target_hz"] = move.get("target_hz")
                 band_decisions.append(detail)
                 continue
 
@@ -2318,7 +2739,109 @@ def _compute_complementary_moves_with_details(
                 detail["decision"] = "skip"
                 detail["reason"] = "top_n_limit"
 
+    # Starvation guard: if all role-target bands were blocked AND no boost survived,
+    # try one recovery move on a non-target band where the track is strong.
+    has_boost = any(m["kind"] == "boost" for m in selected)
+    has_blocked_evidence = any(
+        bd.get("reason") in ("masked_constraint", "lane_blocked", "anti_refill")
+        for bd in band_decisions
+    )
+    if (
+        role != "support"
+        and not has_boost
+        and has_blocked_evidence
+    ):
+        recovery = _starvation_fallback_move(
+            family=family,
+            band_decisions=band_decisions,
+            track_bands=track_bands,
+            masking_constraints=_masking,
+            lane_constraints=_lane,
+            anti_refill_blocks=anti_refill_blocks or {},
+            band_to_reaeq=band_map,
+            role_targets=role_targets,
+        )
+        if recovery is not None:
+            selected.append(recovery)
+            for detail in band_decisions:
+                if detail["band_index"] == recovery["band_index"]:
+                    detail["decision"] = "selected"
+                    detail["reason"] = "starvation_recovery"
+                    detail["gain_db"] = recovery["gain_db"]
+                    detail["target_hz"] = recovery.get("target_hz")
+                    break
+
     return {"moves": selected, "band_decisions": band_decisions}
+
+
+def _starvation_fallback_move(
+    family: str,
+    band_decisions: list[dict],
+    track_bands: list[dict],
+    masking_constraints: dict[int, float],
+    lane_constraints: dict[int, str],
+    anti_refill_blocks: dict[int, dict],
+    band_to_reaeq: dict[int, int],
+    role_targets: set[int],
+) -> dict | None:
+    """Find one legal non-target band for a starved track and return a recovery boost.
+
+    Eligible band: not in role_targets, not masked-cut on this track, not lane-blocked,
+    not anti-refill-blocked, has delta_db >= COMPL_STARVATION_MIN_DELTA_DB, and
+    extends above the sub-bass floor. Returns None if no band qualifies.
+    """
+    # Sort candidate bands by delta_db descending so we boost where the track is strongest
+    sorted_bands = sorted(
+        band_decisions,
+        key=lambda bd: bd.get("delta_db", -120),
+        reverse=True,
+    )
+    for bd in sorted_bands:
+        b = bd["band_index"]
+        if b in role_targets:
+            continue
+        delta_db = bd.get("delta_db", -120)
+        if delta_db < COMPL_STARVATION_MIN_DELTA_DB:
+            continue
+        lo = bd.get("lo", 0)
+        hi = bd.get("hi", 0)
+        if hi <= 80:
+            continue  # No sub recovery
+        # Lane block?
+        if b in lane_constraints:
+            continue
+        # Reaeq band index → check masking + anti-refill
+        reaeq_idx = band_to_reaeq.get(b)
+        if reaeq_idx is None:
+            continue
+        if reaeq_idx in masking_constraints:
+            continue
+        if reaeq_idx in anti_refill_blocks:
+            block = anti_refill_blocks[reaeq_idx]
+            if (
+                block.get("cuts", 0) >= COMPL_ANTI_REFILL_MIN_CUTS
+                or abs(block.get("total_db", 0.0)) >= COMPL_ANTI_REFILL_MIN_TOTAL_DB
+            ):
+                continue
+        # Magnitude
+        boost_db = min(
+            COMPL_STARVATION_MAX_DB,
+            abs(delta_db) * COMPL_STARVATION_FALLBACK_SCALE,
+        )
+        if lo >= 5000:
+            boost_db = min(boost_db, COMPL_HIGH_BAND_BOOST_CAP_DB)
+        if boost_db < COMPL_MIN_MOVE_DB:
+            continue
+        return {
+            "band_index": b,
+            "lo": lo,
+            "hi": hi,
+            "gain_db": round(boost_db, 2),
+            "kind": "boost",
+            "reason": "starvation_recovery",
+            "target_hz": _sub_lane_freq(family, b, lo, hi),
+        }
+    return None
 
 
 def _describe_moves(moves: list[dict]) -> str:
@@ -2354,6 +2877,8 @@ def analyze_track(
     send_command_fn: Callable = _default_send_command,
     *,
     track_index: int | None = None,
+    sample_dur: float | None = None,
+    sample_interval: float | None = None,
 ) -> dict:
     """Analyze a single track's spectral content.
 
@@ -2369,6 +2894,10 @@ def analyze_track(
         kwargs["time_start"] = time_start
     if time_end is not None:
         kwargs["time_end"] = time_end
+    if sample_dur is not None:
+        kwargs["sample_dur"] = sample_dur
+    if sample_interval is not None:
+        kwargs["sample_interval"] = sample_interval
 
     # If another client or a previous interrupted run has analysis in flight,
     # wait/retry instead of failing immediately on single-flight guard.
@@ -2406,6 +2935,8 @@ def auto_eq(
     time_start: float | None = None,
     time_end: float | None = None,
     send_command_fn: Callable = _default_send_command,
+    sample_dur: float | None = None,
+    sample_interval: float | None = None,
 ) -> dict:
     """Run auto-EQ: analyze tracks, compute masking, apply corrective EQ.
 
@@ -2436,7 +2967,8 @@ def auto_eq(
 
         # 2. Analyze priority track
         priority_result = analyze_track(
-            priority_track, time_start, time_end, send_command_fn
+            priority_track, time_start, time_end, send_command_fn,
+            sample_dur=sample_dur, sample_interval=sample_interval,
         )
         analysis_done += 1
         _safe_log(
@@ -2484,7 +3016,8 @@ def auto_eq(
         for yield_name in yield_tracks:
             # Analyze yield track
             yield_result = analyze_track(
-                yield_name, time_start, time_end, send_command_fn
+                yield_name, time_start, time_end, send_command_fn,
+                sample_dur=sample_dur, sample_interval=sample_interval,
             )
             analysis_done += 1
             _safe_log(
@@ -2583,6 +3116,7 @@ def auto_eq(
                 calibration,
                 makeup_mode=makeup_mode,
                 allow_selective_makeup=True,
+                yield_bands=yield_bands,
             )
             makeup_db = makeup_profile["target_makeup_db"]
             makeup_applied_db = makeup_profile["applied_makeup_db"]
@@ -2615,6 +3149,7 @@ def auto_eq(
                 calibration,
                 makeup_mode=makeup_mode,
                 allow_selective_makeup=True,
+                yield_bands=yield_bands,
             )
             eq_params = _build_eq_params_for_reaeq_gains(
                 gain_moves,
@@ -2793,7 +3328,7 @@ def auto_eq_all(
     max_cut_db: float = ALL_MAX_CUT_DB,
     aggressiveness: float = 1.0,
     max_cuts: int = ALL_MAX_CUTS,
-    makeup_mode: str = ALL_MAKEUP_MODE,
+    makeup_mode: str | None = None,
     level: str = "leaf",
     time_start: float | None = None,
     time_end: float | None = None,
@@ -2803,6 +3338,9 @@ def auto_eq_all(
     role_overrides: dict[str, str] | None = None,
     role_hints: dict[str, str] | None = None,
     send_command_fn: Callable = _default_send_command,
+    sample_dur: float | None = None,
+    sample_interval: float | None = None,
+    no_sample: bool = False,
 ) -> dict:
     """Run auto-EQ across all tracks using priority hierarchy.
 
@@ -2822,8 +3360,11 @@ def auto_eq_all(
     family = (family or "all").lower()
     if family not in SUPPORTED_COMPL_FAMILIES:
         family = "all"
-    if strategy == "hybrid":
-        makeup_mode = "off"
+    # Resolve makeup_mode: None = use smart default
+    if makeup_mode is None:
+        makeup_mode = "auto" if strategy == "hybrid" else ALL_MAKEUP_MODE
+    elif strategy == "hybrid" and makeup_mode == "off":
+        pass  # User explicitly said --makeup off — respect it
     if makeup_mode not in {"off", "auto"}:
         makeup_mode = "off"
 
@@ -2832,10 +3373,12 @@ def auto_eq_all(
     if ctx.get("status") != "ok":
         return {"status": "error", "errors": ["Failed to get context"]}
 
-    tracks = ctx.get("tracks", [])
+    all_tracks_raw = ctx.get("tracks", [])
+    # Build family map from UNFILTERED tracks to preserve folder_depth structure.
+    family_map = _build_family_map(all_tracks_raw)
     # Filter out temp/internal tracks, muted tracks, and helper tracks.
     tracks = [
-        t for t in tracks
+        t for t in all_tracks_raw
         if not t["name"].startswith("__tmp_")
         and not t.get("muted")
         and not is_helper_track(t["name"])
@@ -2843,6 +3386,33 @@ def auto_eq_all(
     selected_tracks, resolved_level = _select_auto_eq_all_targets(tracks, level)
     if len(selected_tracks) < 2:
         return {"status": "error", "errors": ["Need at least 2 tracks"]}
+
+    # --- Sampled analysis: smart defaults ---
+    _sampling_auto = False
+    if not no_sample and sample_dur is None and sample_interval is None:
+        project_length = ctx.get("project_length")
+        if project_length is not None:
+            effective_start = time_start or 0.0
+            effective_end = time_end or project_length
+            effective_length = effective_end - effective_start
+            if effective_length > 30.0:
+                sample_dur = 2.0
+                sample_interval = 20.0
+                _sampling_auto = True
+                # Preflight: cap windows at 200
+                est_windows = effective_length / sample_interval
+                if est_windows > 200:
+                    sample_interval = effective_length / 200.0
+    elif no_sample:
+        sample_dur = None
+        sample_interval = None
+    else:
+        # Explicit params provided — verify daemon supports it
+        project_length = ctx.get("project_length")
+        if project_length is None:
+            return {"status": "error", "errors": [
+                "Daemon needs updating for sampled analysis — re-sync and restart"
+            ]}
 
     preflight = _prepare_autoeq_preflight(send_command_fn)
 
@@ -2855,6 +3425,9 @@ def auto_eq_all(
             strategy=strategy, family=family, max_boost_db=max_boost_db,
             role_overrides=role_overrides, role_hints=role_hints,
             send_command_fn=send_command_fn,
+            sample_dur=sample_dur, sample_interval=sample_interval,
+            _sampling_auto=_sampling_auto,
+            family_map=family_map,
         )
     except Exception as exc:
         return _finalize_with_preflight(
@@ -2868,7 +3441,8 @@ def _auto_eq_all_inner(
     *, max_cut_db, aggressiveness, max_cuts, makeup_mode, level,
     time_start, time_end, strategy="subtractive", family="all",
     max_boost_db=COMPL_MAX_BOOST_DB, role_overrides=None, role_hints=None,
-    send_command_fn,
+    send_command_fn, sample_dur=None, sample_interval=None, _sampling_auto=False,
+    family_map: dict[int, str] | None = None,
 ):
     """Inner body of auto_eq_all — extracted for exception-safe preflight restore."""
     # Ensure calibration once upfront — hybrid needs boost range for compl pass
@@ -2877,9 +3451,39 @@ def _auto_eq_all_inner(
         require_boost_range=(strategy == "hybrid"),
     )
 
-    # Score and sort by priority
+    # Pre-compute family membership for smart makeup gating (hybrid only).
+    # Tracks in families with 2+ members get compl boosts in Phase 2 — skip makeup.
+    # Non-family tracks and solo family tracks get makeup since they have no compl compensation.
+    _fm = family_map or {}
+    _family_indices: set[int] = set()
+    if strategy == "hybrid":
+        _fam_counts: dict[str, set[int]] = {}
+        for t in selected_tracks:
+            fam = _fm.get(int(t["index"]))
+            if fam is not None:
+                if family == "all" or fam == family:
+                    _fam_counts.setdefault(fam, set()).add(int(t["index"]))
+        for fam_name, indices in _fam_counts.items():
+            if len(indices) >= 2:
+                _family_indices |= indices
+
+    # Build an index->track lookup for folder-aware analysis.
+    _track_by_idx: dict[int, dict] = {
+        int(t["index"]): t for t in tracks
+        if isinstance(t.get("index"), (int, float))
+    }
+
+    def _parent_name(t: dict) -> str | None:
+        pi = t.get("parent_index", -1)
+        if isinstance(pi, (int, float)) and int(pi) >= 0:
+            parent = _track_by_idx.get(int(pi))
+            if parent:
+                return parent["name"]
+        return None
+
+    # Score and sort by priority (inherit from parent folder if unrecognised)
     scored = [
-        (t["name"], t["index"], match_track_priority(t["name"]))
+        (t["name"], t["index"], match_track_priority(t["name"], _parent_name(t)))
         for t in selected_tracks
     ]
     scored.sort(key=lambda x: x[2], reverse=True)
@@ -2892,12 +3496,6 @@ def _auto_eq_all_inner(
 
     # Analysis cache: keyed by track INDEX to avoid duplicate-name collisions.
     analysis_cache: dict[int, dict] = {}
-
-    # Build an index->track lookup for folder-aware analysis.
-    _track_by_idx: dict[int, dict] = {
-        int(t["index"]): t for t in tracks
-        if isinstance(t.get("index"), (int, float))
-    }
 
     def cached_analyze(track_name: str, track_idx: int) -> dict:
         """Folder-aware cached analysis, keyed by track index.
@@ -2913,12 +3511,21 @@ def _auto_eq_all_inner(
             result = _analyze_folder_aggregate(
                 track_meta, tracks, time_start, time_end,
                 send_command_fn, analysis_cache,
+                sample_dur=sample_dur, sample_interval=sample_interval,
             )
         else:
             result = analyze_track(
                 track_name, time_start, time_end, send_command_fn,
                 track_index=track_idx,
+                sample_dur=sample_dur, sample_interval=sample_interval,
             )
+        # Silence fallback: retry without sampling if sampled result is silent
+        if sample_dur is not None and _is_silent_analysis(result):
+            result = analyze_track(
+                track_name, time_start, time_end, send_command_fn,
+                track_index=track_idx,
+            )
+            result["silence_retry"] = True
         analysis_cache[track_idx] = result
         return result
 
@@ -3026,6 +3633,22 @@ def _auto_eq_all_inner(
                 })
                 continue
 
+        # Spectral importance: per-band max across all priority tracks.
+        # Bands where no priority track has significant energy get low
+        # importance, preventing cuts on harmonic leakage.
+        all_importances = [
+            _compute_spectral_importance(ref["bands"])
+            for ref in ok_priority_results
+        ]
+        num_bands = len(priority_bands)
+        if all_importances and all(len(imp) == num_bands for imp in all_importances):
+            importance_weights = [
+                max(imp[b] for imp in all_importances)
+                for b in range(num_bands)
+            ]
+        else:
+            importance_weights = None
+
         # Analyze yield track (cached, folder-aware)
         yield_result = cached_analyze(name, int(_idx))
         if yield_result.get("status") != "ok":
@@ -3080,15 +3703,18 @@ def _auto_eq_all_inner(
             max_cut_db=max_cut_db,
             aggressiveness=aggressiveness,
             max_cuts=max_cuts,
+            importance_weights=importance_weights,
         )
         cuts = masking["cuts"]
         band_decisions = masking["band_decisions"]
 
+        _allow_makeup = (_idx not in _family_indices)
         makeup_profile = compute_reaeq_makeup_profile(
             cuts,
             calibration,
             makeup_mode=makeup_mode,
-            allow_selective_makeup=True,
+            allow_selective_makeup=_allow_makeup,
+            yield_bands=yield_bands,
         )
         makeup_db = makeup_profile["target_makeup_db"]
         makeup_applied_db = makeup_profile["applied_makeup_db"]
@@ -3124,7 +3750,8 @@ def _auto_eq_all_inner(
             cuts,
             calibration,
             makeup_mode=makeup_mode,
-            allow_selective_makeup=True,
+            allow_selective_makeup=_allow_makeup,
+            yield_bands=yield_bands,
         )
         eq_params = _build_eq_params_for_reaeq_gains(
             gain_moves,
@@ -3249,14 +3876,15 @@ def _auto_eq_all_inner(
     compl_results = []
     all_compl_errors = []
     compl_audit_families = []
+    anti_refill_blocks: dict[int, dict] = {}
 
     if strategy == "hybrid":
         _safe_log(send_command_fn, "=== Phase 2: Complementary boosts (hybrid) ===")
 
-        # 3a. Classify selected tracks into families
+        # 3a. Classify selected tracks into families (bus-inherited)
         family_groups: dict[str, list[dict]] = {}
         for t in selected_tracks:
-            fam = _classify_compl_family(t["name"])
+            fam = _fm.get(int(t["index"]))
             if fam is None:
                 continue
             if family != "all" and fam != family:
@@ -3306,6 +3934,24 @@ def _auto_eq_all_inner(
                     send_command_fn,
                     f"Lane assignment: {lane_summary}",
                 )
+
+        # Anti-refill pre-pass: read masking state across the whole selection so
+        # a singleton/non-family track's [AutoEQ] cuts still influence boost
+        # decisions on family-member tracks. Caches per-track preflight chain to
+        # avoid a second get_track_fx call in the apply pass below.
+        (
+            masking_constraints_by_track,
+            preflight_chain_by_track,
+            preflight_ok_by_track,
+            anti_refill_blocks,
+        ) = _build_anti_refill_aggregate(
+            selected_tracks, send_command_fn, calibration
+        )
+        if anti_refill_blocks:
+            _safe_log(
+                send_command_fn,
+                f"Anti-refill aggregate: {len(anti_refill_blocks)} band(s) blocked",
+            )
 
         for fam_name, fam_tracks in sorted(family_groups.items()):
             fam_errors: list[str] = []
@@ -3359,37 +4005,19 @@ def _auto_eq_all_inner(
                 "errors": fam_errors,
             }
 
-            # 3c cont. Per-track complementary pass
+            # 3c cont. Per-track complementary pass (two-pass for intra-family spreading)
+            # Pass 1: read-only computation — collect work items
+            compl_work_items: list[dict] = []
             for row in fam_rows:
                 track_name = row["track"]
                 role = roles_by_index.get(int(row["index"]), "support")
                 target_index = row.get("index")
 
-                # Read FX chain for masking constraints and stale comp removal
-                masking_constraints: dict[int, float] = {}
-                preflight_fx = send_command_fn(
-                    "get_track_fx", track=int(target_index), strict=True, timeout=10
+                # Use cached preflight from the anti-refill pre-pass
+                masking_constraints = masking_constraints_by_track.get(
+                    int(target_index), {}
                 )
-                preflight_chain = []
-                if preflight_fx.get("status") == "ok":
-                    preflight_chain = preflight_fx.get("fx_chain", [])
-                    masking_constraints = read_masking_constraints(
-                        preflight_chain, calibration
-                    )
-
-                # Always remove stale [AutoEQ-Comp] first
-                if preflight_chain:
-                    existing_comp = find_tagged_fx(preflight_chain, AUTO_EQ_COMPL_TAG)
-                    if existing_comp:
-                        remove_result = send_command_fn(
-                            "remove_fx", track=target_index,
-                            fx_index=existing_comp[0], timeout=10
-                        )
-                        if remove_result.get("status") != "ok":
-                            all_compl_errors.append(
-                                f"Remove stale AutoEQ-Comp on '{track_name}': "
-                                f"{'; '.join(str(e) for e in remove_result.get('errors', ['Unknown']))}"
-                            )
+                preflight_chain = preflight_chain_by_track.get(int(target_index), [])
 
                 details = _compute_complementary_moves_with_details(
                     family=fam_name,
@@ -3403,10 +4031,14 @@ def _auto_eq_all_inner(
                     band_to_reaeq=_band_to_reaeq_map(calibration),
                     boost_only=True,
                     lane_constraints=lane_result["lane_constraints"].get(fam_name, {}),
+                    anti_refill_blocks=anti_refill_blocks,
                 )
                 moves = details["moves"]
                 band_decisions = details["band_decisions"]
-                merge_conflicts = _find_reaeq_merge_conflicts(moves, calibration)
+
+                # Tag moves with track index for deterministic spread ordering
+                for m in moves:
+                    m["_track_index"] = target_index
 
                 # Determine skip reason when no boosts survive
                 skip_reason = None
@@ -3419,12 +4051,53 @@ def _auto_eq_all_inner(
                         bd.get("reason") == "lane_blocked"
                         for bd in band_decisions
                     )
+                    has_anti_refill_skips = any(
+                        bd.get("reason") == "anti_refill"
+                        for bd in band_decisions
+                    )
                     if has_masked_skips:
                         skip_reason = "owned_bands_masked"
                     elif has_lane_skips:
                         skip_reason = "lane_blocked"
+                    elif has_anti_refill_skips:
+                        skip_reason = "anti_refill"
                     else:
                         skip_reason = "no_boost_candidates"
+
+                compl_work_items.append({
+                    "row": row,
+                    "track_name": track_name,
+                    "role": role,
+                    "target_index": target_index,
+                    "preflight_chain": preflight_chain,
+                    "masking_constraints": masking_constraints,
+                    "moves": moves,
+                    "band_decisions": band_decisions,
+                    "skip_reason": skip_reason,
+                })
+
+            # Spread: adjust target_hz across tracks in this family
+            all_boost_moves = [
+                m for wi in compl_work_items for m in wi["moves"]
+            ]
+            _spread_intra_family_boosts(all_boost_moves)
+
+            # Clean up temporary _track_index tags
+            for m in all_boost_moves:
+                m.pop("_track_index", None)
+
+            # Pass 2: apply EQ per track
+            for wi in compl_work_items:
+                track_name = wi["track_name"]
+                role = wi["role"]
+                target_index = wi["target_index"]
+                preflight_chain = wi["preflight_chain"]
+                masking_constraints = wi["masking_constraints"]
+                moves = wi["moves"]
+                band_decisions = wi["band_decisions"]
+                skip_reason = wi["skip_reason"]
+
+                if skip_reason is not None:
                     compl_results.append({
                         "track": track_name,
                         "family": fam_name,
@@ -3444,6 +4117,22 @@ def _auto_eq_all_inner(
                         "message": f"No boosts applied ({skip_reason})",
                     })
                     continue
+
+                # Remove stale [AutoEQ-Comp] right before replacement
+                if preflight_chain:
+                    existing_comp = find_tagged_fx(preflight_chain, AUTO_EQ_COMPL_TAG)
+                    if existing_comp:
+                        remove_result = send_command_fn(
+                            "remove_fx", track=target_index,
+                            fx_index=existing_comp[0], timeout=10
+                        )
+                        if remove_result.get("status") != "ok":
+                            all_compl_errors.append(
+                                f"Remove stale AutoEQ-Comp on '{track_name}': "
+                                f"{'; '.join(str(e) for e in remove_result.get('errors', ['Unknown']))}"
+                            )
+
+                merge_conflicts = _find_reaeq_merge_conflicts(moves, calibration)
 
                 # Build and apply new [AutoEQ-Comp] ReaEQ
                 eq_params = build_eq_params_for_moves(moves, calibration)
@@ -3604,6 +4293,9 @@ def _auto_eq_all_inner(
             "family": family,
             "max_boost_db": max_boost_db,
             "role_overrides": role_overrides,
+            "sample_dur": sample_dur,
+            "sample_interval": sample_interval,
+            "sampling_auto": _sampling_auto,
         },
         "targets": [t[0] for t in scored],
         "band_edges": BAND_EDGES,
@@ -3620,6 +4312,15 @@ def _auto_eq_all_inner(
                 "lane_owners": {str(k): v for k, v in lane_result["lane_owners"].items()},
                 "lane_constraints": lane_result["lane_constraints"],
                 "contested_bands": lane_result["contested_bands"],
+            }
+        if anti_refill_blocks:
+            audit_payload["anti_refill_summary"] = {
+                str(reaeq_idx): {
+                    "cuts": entry["cuts"],
+                    "total_db": round(entry["total_db"], 2),
+                    "tracks": entry["tracks"],
+                }
+                for reaeq_idx, entry in anti_refill_blocks.items()
             }
     audit_path = _write_audit_artifact("auto_eq_all", audit_payload)
 
@@ -3652,6 +4353,9 @@ def auto_eq_compl(
     time_start: float | None = None,
     time_end: float | None = None,
     send_command_fn: Callable = _default_send_command,
+    sample_dur: float | None = None,
+    sample_interval: float | None = None,
+    no_sample: bool = False,
 ) -> dict:
     """Complementary EQ mode for same-family layering (guitar / keys-synth)."""
     family_requested = (family or "all").lower()
@@ -3676,9 +4380,11 @@ def auto_eq_compl(
     if ctx.get("status") != "ok":
         return {"status": "error", "errors": ["Failed to get context"]}
 
-    tracks = ctx.get("tracks", [])
+    all_tracks_raw = ctx.get("tracks", [])
+    # Build family map from UNFILTERED tracks to preserve folder_depth structure.
+    family_map = _build_family_map(all_tracks_raw)
     tracks = [
-        t for t in tracks
+        t for t in all_tracks_raw
         if not t["name"].startswith("__tmp_")
         and not t.get("muted")
         and not is_helper_track(t["name"])
@@ -3687,9 +4393,34 @@ def auto_eq_compl(
     if len(selected_tracks) < 2:
         return {"status": "error", "errors": ["Need at least 2 tracks"]}
 
-    grouped: dict[str, list[dict]] = {"guitar": [], "keys-synth": [], "vocal": []}
+    # --- Sampled analysis: smart defaults ---
+    _sampling_auto = False
+    if not no_sample and sample_dur is None and sample_interval is None:
+        project_length = ctx.get("project_length")
+        if project_length is not None:
+            effective_start = time_start or 0.0
+            effective_end = time_end or project_length
+            effective_length = effective_end - effective_start
+            if effective_length > 30.0:
+                sample_dur = 2.0
+                sample_interval = 20.0
+                _sampling_auto = True
+                est_windows = effective_length / sample_interval
+                if est_windows > 200:
+                    sample_interval = effective_length / 200.0
+    elif no_sample:
+        sample_dur = None
+        sample_interval = None
+    else:
+        project_length = ctx.get("project_length")
+        if project_length is None:
+            return {"status": "error", "errors": [
+                "Daemon needs updating for sampled analysis — re-sync and restart"
+            ]}
+
+    grouped: dict[str, list[dict]] = {}
     for track in selected_tracks:
-        fam = _classify_compl_family(track["name"])
+        fam = family_map.get(int(track["index"]))
         if fam is not None:
             grouped.setdefault(fam, []).append(track)
 
@@ -3713,6 +4444,8 @@ def auto_eq_compl(
             max_cut_db=max_cut_db, max_boost_db=max_boost_db, max_moves=max_moves,
             level=level, time_start=time_start, time_end=time_end,
             send_command_fn=send_command_fn,
+            sample_dur=sample_dur, sample_interval=sample_interval,
+            _sampling_auto=_sampling_auto,
         )
     except Exception as exc:
         return _finalize_with_preflight(
@@ -3726,6 +4459,7 @@ def _auto_eq_compl_inner(
     *, family_requested, normalized_overrides, normalized_hints=None,
     max_cut_db, max_boost_db, max_moves,
     level, time_start, time_end, send_command_fn,
+    sample_dur=None, sample_interval=None, _sampling_auto=False,
 ):
     """Inner body of auto_eq_compl — extracted for exception-safe preflight restore."""
     calibration = ensure_calibration(send_command_fn, require_boost_range=True)
@@ -3762,12 +4496,21 @@ def _auto_eq_compl_inner(
             result = _analyze_folder_aggregate(
                 track_meta, tracks, time_start, time_end,
                 send_command_fn, analysis_cache,
+                sample_dur=sample_dur, sample_interval=sample_interval,
             )
         else:
             result = analyze_track(
                 track_name, time_start, time_end, send_command_fn,
                 track_index=track_idx,
+                sample_dur=sample_dur, sample_interval=sample_interval,
             )
+        # Silence fallback: retry without sampling if sampled result is silent
+        if sample_dur is not None and _is_silent_analysis(result):
+            result = analyze_track(
+                track_name, time_start, time_end, send_command_fn,
+                track_index=track_idx,
+            )
+            result["silence_retry"] = True
         analysis_cache[track_idx] = result
         return result
 
@@ -3790,6 +4533,22 @@ def _auto_eq_compl_inner(
     if len(compl_family_analysis) >= 2:
         compl_spectra = _compute_family_aggregate_spectrum(compl_family_analysis)
         compl_lane_result = _assign_spectral_lanes(compl_spectra, compl_family_analysis)
+
+    # Anti-refill pre-pass: read masking state across the whole selection so
+    # cuts on singleton/non-family tracks still influence boost decisions.
+    (
+        masking_constraints_by_track,
+        preflight_chain_by_track,
+        preflight_ok_by_track,
+        anti_refill_blocks,
+    ) = _build_anti_refill_aggregate(
+        selected_tracks, send_command_fn, calibration
+    )
+    if anti_refill_blocks:
+        _safe_log(
+            send_command_fn,
+            f"Anti-refill aggregate: {len(anti_refill_blocks)} band(s) blocked",
+        )
 
     for fam_name, fam_tracks in grouped.items():
         fam_track_names = [t["name"] for t in fam_tracks]
@@ -3840,20 +4599,22 @@ def _auto_eq_compl_inner(
             "errors": fam_errors,
         }
 
+        # Two-pass for intra-family frequency spreading
+        # Pass 1: read-only computation — collect work items
+        compl_work_items: list[dict] = []
         for row in fam_rows:
             track_name = row["track"]
             role = roles_by_index.get(int(row["index"]), "support")
             target_index = row.get("index")
 
-            # Read existing FX chain to detect masking constraints from [AutoEQ].
-            masking_constraints: dict[int, float] = {}
-            preflight_fx = send_command_fn(
-                "get_track_fx", track=int(target_index), strict=True, timeout=10
-            )
-            if preflight_fx.get("status") == "ok":
-                preflight_chain = preflight_fx.get("fx_chain", [])
-                masking_constraints = read_masking_constraints(
-                    preflight_chain, calibration
+            # Use cached preflight from the anti-refill pre-pass
+            tidx = int(target_index)
+            preflight_ok = preflight_ok_by_track.get(tidx, False)
+            preflight_chain = preflight_chain_by_track.get(tidx, [])
+            masking_constraints = masking_constraints_by_track.get(tidx, {})
+            if not preflight_ok:
+                all_errors.append(
+                    f"Pre-flight FX read failed for '{track_name}'"
                 )
 
             details = _compute_complementary_moves_with_details(
@@ -3867,10 +4628,47 @@ def _auto_eq_compl_inner(
                 masking_constraints=masking_constraints,
                 band_to_reaeq=_band_to_reaeq_map(calibration),
                 lane_constraints=compl_lane_result["lane_constraints"].get(fam_name, {}),
+                anti_refill_blocks=anti_refill_blocks,
             )
             moves = details["moves"]
             band_decisions = details["band_decisions"]
-            merge_conflicts = _find_reaeq_merge_conflicts(moves, calibration)
+
+            # Tag moves with track index for deterministic spread ordering
+            for m in moves:
+                m["_track_index"] = target_index
+
+            compl_work_items.append({
+                "row": row,
+                "track_name": track_name,
+                "role": role,
+                "target_index": target_index,
+                "preflight_chain": preflight_chain,
+                "preflight_ok": preflight_ok,
+                "masking_constraints": masking_constraints,
+                "moves": moves,
+                "band_decisions": band_decisions,
+            })
+
+        # Spread: adjust target_hz across tracks in this family
+        all_boost_moves = [
+            m for wi in compl_work_items for m in wi["moves"]
+        ]
+        _spread_intra_family_boosts(all_boost_moves)
+
+        # Clean up temporary _track_index tags
+        for m in all_boost_moves:
+            m.pop("_track_index", None)
+
+        # Pass 2: apply EQ per track
+        for wi in compl_work_items:
+            track_name = wi["track_name"]
+            role = wi["role"]
+            target_index = wi["target_index"]
+            preflight_chain = wi["preflight_chain"]
+            preflight_ok = wi["preflight_ok"]
+            masking_constraints = wi["masking_constraints"]
+            moves = wi["moves"]
+            band_decisions = wi["band_decisions"]
 
             if not moves:
                 result_row = {
@@ -3893,10 +4691,11 @@ def _auto_eq_compl_inner(
                 })
                 continue
 
+            merge_conflicts = _find_reaeq_merge_conflicts(moves, calibration)
             eq_params = build_eq_params_for_moves(moves, calibration)
 
-            # Reuse preflight FX chain read (already done for masking constraints).
-            if preflight_fx.get("status") == "ok":
+            # Remove stale [AutoEQ-Comp] right before replacement
+            if preflight_ok:
                 existing = find_tagged_fx(preflight_chain, AUTO_EQ_COMPL_TAG)
                 if existing:
                     remove_result = send_command_fn(
@@ -3907,11 +4706,6 @@ def _auto_eq_compl_inner(
                             f"Remove existing AutoEQ-Comp on '{track_name}': "
                             f"{'; '.join(str(e) for e in remove_result.get('errors', ['Unknown']))}"
                         )
-            else:
-                all_errors.append(
-                    f"Pre-flight FX read failed for '{track_name}': "
-                    f"{'; '.join(str(e) for e in preflight_fx.get('errors', ['Unknown']))}"
-                )
 
             vis_params, eq_body_params = _split_visible_bands_param(eq_params)
             post_params = [*vis_params, *eq_body_params]
@@ -4036,6 +4830,9 @@ def _auto_eq_compl_inner(
             "role_overrides": normalized_overrides,
             "time_start": time_start,
             "time_end": time_end,
+            "sample_dur": sample_dur,
+            "sample_interval": sample_interval,
+            "sampling_auto": _sampling_auto,
         },
         "band_edges": BAND_EDGES,
         "band_labels": BAND_LABELS,
@@ -4048,6 +4845,15 @@ def _auto_eq_compl_inner(
             "lane_owners": {str(k): v for k, v in compl_lane_result["lane_owners"].items()},
             "lane_constraints": compl_lane_result["lane_constraints"],
             "contested_bands": compl_lane_result["contested_bands"],
+        }
+    if anti_refill_blocks:
+        audit_payload["anti_refill_summary"] = {
+            str(reaeq_idx): {
+                "cuts": entry["cuts"],
+                "total_db": round(entry["total_db"], 2),
+                "tracks": entry["tracks"],
+            }
+            for reaeq_idx, entry in anti_refill_blocks.items()
         }
     audit_path = _write_audit_artifact("auto_eq_compl", audit_payload)
 
@@ -4136,6 +4942,9 @@ def auto_eq_sections(
     write_mode: str = "auto",
     hybrid_selective_makeup: bool = False,
     send_command_fn: Callable = _default_send_command,
+    sample_dur: float | None = None,
+    sample_interval: float | None = None,
+    no_sample: bool = False,
 ) -> dict:
     """Run per-section auto-EQ with automation envelopes.
 
@@ -4190,9 +4999,11 @@ def auto_eq_sections(
     if ctx.get("status") != "ok":
         return {"status": "error", "errors": ["Failed to get context"]}
 
-    tracks = ctx.get("tracks", [])
+    all_tracks_raw = ctx.get("tracks", [])
+    # Build family map from UNFILTERED tracks to preserve folder_depth structure.
+    family_map = _build_family_map(all_tracks_raw)
     tracks = [
-        t for t in tracks
+        t for t in all_tracks_raw
         if not t["name"].startswith("__tmp_")
         and not t.get("muted")
         and not is_helper_track(t["name"])
@@ -4200,6 +5011,30 @@ def auto_eq_sections(
     selected_tracks, resolved_level = _select_auto_eq_all_targets(tracks, level)
     if len(selected_tracks) < 2:
         return {"status": "error", "errors": ["Need at least 2 tracks"]}
+
+    # --- Sampled analysis: smart defaults (per-section length for sections) ---
+    _sampling_auto = False
+    if not no_sample and sample_dur is None and sample_interval is None:
+        project_length = ctx.get("project_length")
+        if project_length is not None:
+            # Use max section length for smart default decision
+            max_sec_len = max((e - s) for _, s, e in sections) if sections else 0.0
+            if max_sec_len > 30.0:
+                sample_dur = 2.0
+                sample_interval = 20.0
+                _sampling_auto = True
+                est_windows = max_sec_len / sample_interval
+                if est_windows > 200:
+                    sample_interval = max_sec_len / 200.0
+    elif no_sample:
+        sample_dur = None
+        sample_interval = None
+    else:
+        project_length = ctx.get("project_length")
+        if project_length is None:
+            return {"status": "error", "errors": [
+                "Daemon needs updating for sampled analysis — re-sync and restart"
+            ]}
 
     # Verify daemon support before any preflight mutation.
     probe = send_command_fn(
@@ -4230,6 +5065,9 @@ def auto_eq_sections(
             write_mode=write_mode,
             hybrid_selective_makeup=hybrid_selective_makeup,
             send_command_fn=send_command_fn,
+            sample_dur=sample_dur, sample_interval=sample_interval,
+            _sampling_auto=_sampling_auto,
+            family_map=family_map,
         )
     except Exception as exc:
         return _finalize_with_preflight(
@@ -4243,6 +5081,8 @@ def _auto_eq_sections_inner(
     *, sections, max_cut_db, aggressiveness, max_cuts, level,
     analyze_range, makeup_mode, strategy, family, max_boost_db,
     role_overrides, write_mode, hybrid_selective_makeup, send_command_fn,
+    sample_dur=None, sample_interval=None, _sampling_auto=False,
+    family_map: dict[int, str] | None = None,
 ):
     """Inner body of auto_eq_sections — exception-safe preflight restore."""
 
@@ -4259,17 +5099,25 @@ def _auto_eq_sections_inner(
     # Clamp boost cap
     max_boost_db = min(max_boost_db, COMPL_MAX_BOOST_DB)
 
-    # Score and sort by priority
-    scored = [
-        (t["name"], t["index"], match_track_priority(t["name"]))
-        for t in selected_tracks
-    ]
-    scored.sort(key=lambda x: x[2], reverse=True)
-
     _track_by_idx: dict[int, dict] = {
         int(t["index"]): t for t in tracks
         if isinstance(t.get("index"), (int, float))
     }
+
+    def _parent_name(t: dict) -> str | None:
+        pi = t.get("parent_index", -1)
+        if isinstance(pi, (int, float)) and int(pi) >= 0:
+            parent = _track_by_idx.get(int(pi))
+            if parent:
+                return parent["name"]
+        return None
+
+    # Score and sort by priority (inherit from parent folder if unrecognised)
+    scored = [
+        (t["name"], t["index"], match_track_priority(t["name"], _parent_name(t)))
+        for t in selected_tracks
+    ]
+    scored.sort(key=lambda x: x[2], reverse=True)
 
     all_errors: list[str] = []
 
@@ -4624,17 +5472,17 @@ def _auto_eq_sections_inner(
         if makeup_mode == "auto" and not hybrid_selective_makeup:
             _safe_log(
                 send_command_fn,
-                "Auto-EQ Sections: selective makeup disabled in hybrid mode "
-                "(complementary boosts only).",
+                "Auto-EQ Sections: selective makeup auto-enabled for non-family tracks.",
             )
         elif makeup_mode == "auto" and hybrid_selective_makeup:
             _safe_log(
                 send_command_fn,
-                "Auto-EQ Sections: hybrid selective makeup enabled.",
+                "Auto-EQ Sections: hybrid selective makeup enabled for all tracks.",
             )
+        _fm = family_map or {}
         raw_groups: dict[str, list[int]] = {}
         for idx, info in track_fx_info.items():
-            fam = _classify_compl_family(info["name"])
+            fam = _fm.get(idx)
             if fam is None:
                 continue
             if family != "all" and fam != family:
@@ -4642,6 +5490,11 @@ def _auto_eq_sections_inner(
             raw_groups.setdefault(fam, []).append(idx)
         # Keep only families with 2+ members
         family_groups = {k: v for k, v in raw_groups.items() if len(v) >= 2}
+
+    # Pre-compute set of all family-member track indices for makeup gating.
+    _family_indices_sec: set[int] = set()
+    for fam_name, members in family_groups.items():
+        _family_indices_sec.update(members)
 
     # -----------------------------------------------------------------------
     # Phase 2: Per-section analysis and masking computation
@@ -4695,12 +5548,21 @@ def _auto_eq_sections_inner(
                 result = _analyze_folder_aggregate(
                     track_meta, tracks, a_start, a_end,
                     send_command_fn, analysis_cache,
+                    sample_dur=sample_dur, sample_interval=sample_interval,
                 )
             else:
                 result = analyze_track(
                     track_name, a_start, a_end, send_command_fn,
                     track_index=track_idx,
+                    sample_dur=sample_dur, sample_interval=sample_interval,
                 )
+            # Silence fallback: retry without sampling
+            if sample_dur is not None and _is_silent_analysis(result):
+                result = analyze_track(
+                    track_name, a_start, a_end, send_command_fn,
+                    track_index=track_idx,
+                )
+                result["silence_retry"] = True
             analysis_cache[track_idx] = result
             return result
 
@@ -4778,6 +5640,20 @@ def _auto_eq_sections_inner(
                         })
                     continue
 
+            # Spectral importance weighting (same logic as auto_eq_all)
+            all_importances = [
+                _compute_spectral_importance(ref["bands"])
+                for ref in ok_priority_results
+            ]
+            num_bands = len(priority_bands)
+            if all_importances and all(len(imp) == num_bands for imp in all_importances):
+                importance_weights = [
+                    max(imp[b_] for imp in all_importances)
+                    for b_ in range(num_bands)
+                ]
+            else:
+                importance_weights = None
+
             # Analyze yield track
             yield_result = cached_analyze_section(name, idx)
             if yield_result.get("status") != "ok":
@@ -4796,6 +5672,7 @@ def _auto_eq_sections_inner(
                 max_cut_db=max_cut_db,
                 aggressiveness=aggressiveness,
                 max_cuts=max_cuts,
+                importance_weights=importance_weights,
             )
             cuts = _annotate_cut_contributors(
                 masking["cuts"],
@@ -4944,7 +5821,8 @@ def _auto_eq_sections_inner(
                 cuts,
                 calibration,
                 makeup_mode=makeup_mode,
-                allow_selective_makeup=(strategy != "hybrid" or hybrid_selective_makeup),
+                allow_selective_makeup=(strategy != "hybrid" or hybrid_selective_makeup or idx not in _family_indices_sec),
+                yield_bands=yield_bands,
             )
             selective_boosts = makeup_profile.get("boosts_by_reaeq_band", {})
             makeup_db = makeup_profile.get("target_makeup_db", 0.0)
@@ -5199,6 +6077,9 @@ def _auto_eq_sections_inner(
             "write_mode": write_mode,
             "write_mode_resolved": effective_mode,
             "hybrid_selective_makeup": hybrid_selective_makeup,
+            "sample_dur": sample_dur,
+            "sample_interval": sample_interval,
+            "sampling_auto": _sampling_auto,
         },
         "sections": [
             {"label": l, "start": s, "end": e}
