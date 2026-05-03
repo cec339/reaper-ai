@@ -2,6 +2,23 @@
 
 AI-powered FX chain controller for [REAPER](https://www.reaper.fm/). Talk to your DAW in plain English — create tracks, tweak FX parameters, apply presets, and build entire FX chains through conversation.
 
+## What's new in v0.3.1
+
+Auto-EQ refinements after real-mix usage revealed two structural problems with hybrid mode (cuts undoing themselves; whole instrument families losing identity after subtractive cuts). Three new guards on the complementary boost pass:
+
+- **Support cap** — support tracks (the quiet helpers in a family) can no longer reach the anchor's +6 dB ceiling. Hard cap at 3 dB enforced in both deficit-driven and ownership-driven boost paths.
+- **Anti-refill guard** — if multiple tracks were cut in a band to make room (e.g. snare and vocal both carved out at 320–640 Hz), the boost pass can no longer come along and refill that band with another track. Aggregates `[AutoEQ]` cuts across the entire selection (including non-family/singleton tracks) and blocks complementary boosts on bands that absorbed mix-wide cleanup.
+- **Starvation guard with fallback** — when a track's role-target bands are all blocked (by lane ownership, by its own subtractive cuts, or by anti-refill), the system now picks one non-target band where the track has high family-relative energy and applies a small recovery boost (≤ 2.5 dB). Refuses if no qualifying band exists — no participation-trophy boosts on genuinely flat tracks.
+
+Plus accumulated tuning from real-mix iterations:
+
+- **Energy-weighted selective makeup** — makeup gain on uncut bands now weighted by the yield track's own spectral energy. Bands with no real energy get no makeup.
+- **Family map with bus inheritance** — leaf tracks inherit their family classification (guitar / keys-synth / vocal / cymbal) from their parent bus when the leaf name is unrecognised.
+- **Intra-family frequency spreading** — same-family tracks boosting in the same band get distinct sub-lane Hz via log spacing, so they're not literally on top of each other.
+- **Priority weight reorder** — piano > keys > guitar > synth > hihat > cymbal, with cymbal stays above the 0.5 default boundary so the priority cascade behaves correctly.
+- **Makeup retuning** — `MAKEUP_BIAS` 1.5 → 1.2, `MAKEUP_FLOOR_DB` 1.2 → 0.6, `MAKEUP_PER_BAND_CAP_DB` 2.5 → 1.8.
+- **Audit artifacts** — auto-eq runs now write a JSON audit with per-band decisions, lane assignments, anti-refill summary, and starvation recovery moves.
+
 ## What's new in v0.3.0
 
 - **Auto-EQ system** — four modes of automatic frequency masking correction:
