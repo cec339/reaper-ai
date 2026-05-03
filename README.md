@@ -4,20 +4,68 @@ AI-powered FX chain controller for [REAPER](https://www.reaper.fm/). Talk to you
 
 ## What's new in v0.3.1
 
-Auto-EQ refinements after real-mix usage revealed two structural problems with hybrid mode (cuts undoing themselves; whole instrument families losing identity after subtractive cuts). Three new guards on the complementary boost pass:
+### Live anti-mask graph (real-time mixing assistant)
 
-- **Support cap** — support tracks (the quiet helpers in a family) can no longer reach the anchor's +6 dB ceiling. Hard cap at 3 dB enforced in both deficit-driven and ownership-driven boost paths.
-- **Anti-refill guard** — if multiple tracks were cut in a band to make room (e.g. snare and vocal both carved out at 320–640 Hz), the boost pass can no longer come along and refill that band with another track. Aggregates `[AutoEQ]` cuts across the entire selection (including non-family/singleton tracks) and blocks complementary boosts on bands that absorbed mix-wide cleanup.
-- **Starvation guard with fallback** — when a track's role-target bands are all blocked (by lane ownership, by its own subtractive cuts, or by anti-refill), the system now picks one non-target band where the track has high family-relative energy and applies a small recovery boost (≤ 2.5 dB). Refuses if no qualifying band exists — no participation-trophy boosts on genuinely flat tracks.
+A new live system that watches your mix as it plays and helps an instrument poke through when it's being masked, with no offline analysis pass. JSFX workers run on each tracked source, publishing FFT energy through REAPER's shared `gmem`; a graph of priority relationships then drives anti-masking JSFX inserts on the lower-priority tracks. Stereo-aware (L/R analysis), with drum super-family caps and ancestor-chain inheritance for buses.
 
-Plus accumulated tuning from real-mix iterations:
+```bash
+reaper-ai live-graph-setup            # auto-detect tracks, install workers + anti-mask FX
+reaper-ai live-graph-status           # check what's wired up
+reaper-ai live-graph-stats            # sample real-time pressure values for tuning
+reaper-ai live-graph-remove           # tear it all down
+```
 
-- **Energy-weighted selective makeup** — makeup gain on uncut bands now weighted by the yield track's own spectral energy. Bands with no real energy get no makeup.
-- **Family map with bus inheritance** — leaf tracks inherit their family classification (guitar / keys-synth / vocal / cymbal) from their parent bus when the leaf name is unrecognised.
-- **Intra-family frequency spreading** — same-family tracks boosting in the same band get distinct sub-lane Hz via log spacing, so they're not literally on top of each other.
-- **Priority weight reorder** — piano > keys > guitar > synth > hihat > cymbal, with cymbal stays above the 0.5 default boundary so the priority cascade behaves correctly.
+The toggle script `toggle_antimask.lua` (loaded as a REAPER Action) bypasses the whole system in one click for A/B comparison. Note: gmem state is lost when REAPER closes, so re-run `live-graph-setup` after reopening a project.
+
+### Auto-EQ structural guards (hybrid mode)
+
+Real-mix usage exposed two structural problems with the complementary boost pass: cuts being undone immediately by boosts on the same band, and whole instrument families losing identity after subtractive cuts. Three new guards:
+
+- **Support cap** — support tracks can no longer reach the anchor's +6 dB ceiling. Hard cap at 3 dB enforced in both deficit-driven and ownership-driven boost paths.
+- **Anti-refill guard** — if multiple tracks were cut in a band (e.g. snare and vocal both carved out at 320–640 Hz), the boost pass can no longer refill that band with another track. Aggregates `[AutoEQ]` cuts across the entire selection (including non-family/singleton tracks).
+- **Starvation guard with fallback** — when a track's role-target bands are all blocked, the system picks one non-target band where the track has high family-relative energy and applies a small recovery boost (≤ 2.5 dB). Refuses if no qualifying band exists — no participation-trophy boosts.
+
+### Auto-EQ sampling for long sessions
+
+Hour-long arrangements now analyze in seconds, not minutes. Sampled analysis takes short windows at fixed intervals across the project instead of reading every sample. Defaults auto-tune from project length, with manual overrides:
+
+```bash
+reaper-ai auto-eq-all --no-sample                 # force full analysis
+reaper-ai auto-eq-all --sample-dur 2 --sample-interval 20
+```
+
+A silence-fallback retry kicks in automatically if a sampled track's windows happened to all land on quiet sections.
+
+### FX parameter envelopes
+
+Auto-EQ-sections writes time-varying ReaEQ moves directly to FX parameter envelopes, so EQ adjustments follow the song rather than just snapshotting one section. Daemon ops `set_fx_envelopes` / `has_fx_envelopes` handle the API/PARMENV value-space conversion (api space ≠ envelope space — getting this wrong silently doubles your gain).
+
+### Auto-EQ tuning from real-mix iterations
+
+- **Energy-weighted selective makeup** — makeup gain on uncut bands weighted by the yield track's own spectral energy. Bands with no real energy get no makeup.
+- **Family map with bus inheritance** — leaf tracks inherit family classification (guitar / keys-synth / vocal / cymbal) from their parent bus when the leaf name is unrecognised.
+- **Intra-family frequency spreading** — same-family tracks boosting in the same band get distinct sub-lane Hz via log spacing.
+- **Priority reorder** — piano > keys > guitar > synth > hihat > cymbal, with cymbal kept above the 0.5 default boundary.
 - **Makeup retuning** — `MAKEUP_BIAS` 1.5 → 1.2, `MAKEUP_FLOOR_DB` 1.2 → 0.6, `MAKEUP_PER_BAND_CAP_DB` 2.5 → 1.8.
-- **Audit artifacts** — auto-eq runs now write a JSON audit with per-band decisions, lane assignments, anti-refill summary, and starvation recovery moves.
+- **Audit JSON artifacts** — every auto-eq run writes a per-band decision audit including lane assignments, anti-refill summary, starvation moves, and family-mean spectra. Useful for understanding why the system did or didn't act on a given track.
+
+### ReaGate / drum augment gate refinements
+
+`setup-reagate` and `drum-augment` now expose pre-open lookahead, sidechain highpass, and hysteresis. Important when triggering a sample from a bleedy live snare track:
+
+```bash
+reaper-ai drum-augment "Snare Top" --drum-type snare \
+  --gate-pre-open 1.0 --gate-highpass 200 --gate-hysteresis 4.0
+```
+
+### Smaller additions
+
+- **`set-item-rate`** — time-stretch a media item by ratio or by from/to BPM.
+- **`toggle-autoeq`** — bypass/restore all `[AutoEQ]` and `[AutoEQ-Comp]` FX in one click for A/B.
+- **`benchmark-fft` / `validate-fft-bands`** — daemon-side FFT diagnostics for tuning analyzer accuracy.
+- **`calibrate-reaeq`** — capability cascade across visible-bands → 11-band preset → 5-band fallback, cached at `queue/calibration/reaeq_calibration.json`.
+- **Track-ref coercion** — CLI commands now accept either a track name or a numeric index; numeric strings get coerced to ints automatically.
+- **Daemon ops for transport, peak metering, track delete, main-send routing, and namespace-restricted gmem** — the daemon side is wired even where there's no top-level CLI/MCP yet.
 
 ## What's new in v0.3.0
 
@@ -157,6 +205,10 @@ Both the Lua daemon and Python bridge need to point at the same queue path.
 | `reaper_auto_eq_compl` | Complementary EQ within instrument families |
 | `reaper_auto_eq_sections` | Time-varying EQ automation across song sections |
 | `reaper_recover_autoeq` | Recover auto-EQ state after interruption |
+| `reaper_live_graph_setup` | Install live anti-mask graph (workers + JSFX inserts) |
+| `reaper_live_graph_status` | Report what live anti-mask is currently wired to |
+| `reaper_live_graph_stats` | Sample real-time pressure values from gmem for tuning |
+| `reaper_live_graph_remove` | Tear down the live anti-mask graph |
 
 ## Building the exe
 
@@ -178,7 +230,13 @@ reaper-ai/
     ipc.py           # File-based IPC with the Lua daemon
     reaper_state.py  # Response formatters
     auto_eq.py       # Spectral analysis, masking detection, auto-EQ engine
+    live_graph.py    # Live anti-mask graph builder (priority + ancestor chain)
+  jsfx/              # JSFX plugins for live anti-mask (FFT workers, anti-mask insert)
+  install_jsfx.py    # Installer for the JSFX plugins (copies to REAPER's Effects folder)
   reaper_daemon.lua  # Lua daemon that runs inside REAPER
+  toggle_antimask.lua  # REAPER Action: bypass/restore live anti-mask
+  tests/             # pytest unit tests (lane assignment, family map, live graph)
+  docs/              # Design notes and AI handoff status
   samples/           # Sample audio files for drum augment
   sync-daemon.ps1    # Dev helper: sync daemon to REAPER Scripts folder
   pyproject.toml     # Package config, dependencies, entry points
